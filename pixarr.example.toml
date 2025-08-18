@@ -1,0 +1,30 @@
+# Pixarr configuration template
+# Copy this file to: pixarr.toml
+# CLI flags always override values here.
+
+[paths]
+# Root folder where Pixarr stores the DB and media tree.
+# If omitted, defaults to "<repo>/data".
+# Example:
+# data_dir = "/Volumes/Data/Pixarr/data"
+
+[ingest]
+# Start in dry-run mode unless --write is passed.
+dry_run_default = true
+
+# Capture-time resolution policy:
+# 1) EXIF/QuickTime (always tried first)
+# 2) Filename-derived (only if allow_filename_dates = true)
+# 3) File dates (ModifyDate/FileModifyDate) (only if allow_file_dates = true)
+allow_filename_dates = false
+allow_file_dates = false
+
+[quarantine]
+# Enable/disable quarantine buckets.
+missing_datetime = true
+junk = true
+unsupported_ext = true
+zero_bytes = true
+stat_error = true
+move_failed = true
+dupes = true

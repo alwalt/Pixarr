@@ -4,15 +4,16 @@
 """
 Pixarr — ingest pass over Staging subfolders.
 
-Changes in this build:
-- EXIF-only: taken_at comes ONLY from EXIF/QuickTime datetime tags.
-- Hard fail without exiftool.
-- Files with no EXIF/QuickTime capture date are QUARANTINED to Quarantine/missing_datetime/.
-- Dry-run by default; use --write to actually move files to Review/.
+Highlights:
+- EXIF/QuickTime first; optional filename-derived date fallback (--allow-filename-dates)
+- Optional file-date fallback (--allow-file-dates) if you really want ModifyDate/FileModifyDate
+- Quarantine policy is driven by pixarr.toml ([quarantine] section)
+- Dry-run by default; use --write to actually move files to Review/
+- DB auto-initializes from db/schema.sql the first time
 
 Requirements:
 - Python 3.10+
-- exiftool on PATH (hard requirement)
+- exiftool on PATH
 """
 
 import os
@@ -31,7 +32,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict
 
 # ---------- Global toggles ----------
-DRY_RUN = True  # default; overridden by --write
+DRY_RUN = True  # overridden by --write
 
 SUPPORTED_EXT = {
     ".jpg", ".jpeg", ".heic", ".png", ".tif", ".tiff", ".gif",
@@ -44,20 +45,10 @@ JUNK_FILES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 JUNK_PREFIXES = {"._"}  # AppleDouble resource forks like ._IMG_1234.JPG
 DIR_IGNORE = {".Spotlight-V100", ".fseventsd", ".Trashes", ".TemporaryItems"}
 
+# Fallback toggle set by CLI
+ALLOW_FILENAME_DATES = False
 
-# Quarantine toggles
-QUARANTINE_JUNK         = True
-QUARANTINE_UNSUPPORTED  = True
-QUARANTINE_ZERO_BYTE    = True
-QUARANTINE_STAT_ERROR   = True
-QUARANTINE_MOVE_FAILURE = True
-QUARANTINE_DUPES        = True  # dupes of existing library content
-QUARANTINE_MISSING_DATETIME = True # NEW: quarantine when no EXIF/QuickTime capture date is present
-
-# Fallback toggles (set via CLI flags in main())
-ALLOW_FILENAME_DATES = False   # default; set from --allow-filename-dates
-
-# ---------- Paths configured at runtime ----------
+# Paths configured at runtime
 DATA_DIR: Path
 DB_PATH: Path
 REVIEW_ROOT: Path
@@ -65,13 +56,19 @@ QUARANTINE_ROOT: Path
 STAGING_SOURCES: Dict[str, Path]
 SCHEMA_PATH: Path
 
-# ---------- exiftool (hard requirement) ----------
+# Runtime quarantine policy (from pixarr.toml)
+QUAR: Dict[str, bool] = {}
+
+# exiftool (checked at runtime)
 EXIFTOOL_PATH = shutil.which("exiftool")
-if not EXIFTOOL_PATH:
-    sys.stderr.write("FATAL: exiftool not found on PATH. Install it first (e.g., Homebrew: brew install exiftool).\n")
-    sys.exit(1)
+
 
 # ---------- Utilities ----------
+
+def ensure_exiftool() -> None:
+    if not EXIFTOOL_PATH:
+        sys.stderr.write("FATAL: exiftool not found on PATH. Install it (e.g., brew install exiftool).\n")
+        sys.exit(1)
 
 def repo_root() -> Path:
     """Resolve repo root as folder containing this file's parent (Pixarr/)."""
@@ -81,18 +78,11 @@ def log(msg: str) -> None:
     print(msg, flush=sys.stdout.isatty())
 
 def ensure_dirs() -> None:
+    """Create core dirs; quarantine reason subfolders are created lazily."""
     (DATA_DIR / "db").mkdir(parents=True, exist_ok=True)
     for d in [
         "Staging/pc", "Staging/other", "Staging/icloud", "Staging/sdcard",
         "Review", "Library", "Quarantine",
-        # subfolder for our missing-date quarantine class
-        "Quarantine/missing_datetime",
-        "Quarantine/junk",
-        "Quarantine/unsupported_ext",
-        "Quarantine/zero_bytes",
-        "Quarantine/stat_error",
-        "Quarantine/move_failed",
-        "Quarantine/duplicate_in_library",
     ]:
         (DATA_DIR / "media" / d).mkdir(parents=True, exist_ok=True)
 
@@ -136,6 +126,35 @@ def pathize(base: Path) -> None:
     }
     SCHEMA_PATH = repo_root() / "db" / "schema.sql"
 
+def load_config(path: Path) -> dict:
+    """Load pixarr.toml if present; return dict of settings."""
+    cfg = {}
+    try:
+        import tomllib  # Python 3.11+
+        if path.exists():
+            cfg = tomllib.loads(path.read_text(encoding="utf-8"))
+    except ModuleNotFoundError:
+        try:
+            import tomli  # Python 3.10 backport
+            if path.exists():
+                cfg = tomli.loads(path.read_text(encoding="utf-8"))
+        except ModuleNotFoundError:
+            pass
+    return cfg
+
+def build_quarantine_cfg(cfg_quar: dict) -> Dict[str, bool]:
+    """Create the effective quarantine policy from TOML (defaults are safe)."""
+    return {
+        "junk":              bool(cfg_quar.get("junk",              True)),
+        "unsupported_ext":   bool(cfg_quar.get("unsupported_ext",   True)),
+        "zero_bytes":        bool(cfg_quar.get("zero_bytes",        True)),
+        "stat_error":        bool(cfg_quar.get("stat_error",        True)),
+        "move_failed":       bool(cfg_quar.get("move_failed",       True)),
+        "dupes":             bool(cfg_quar.get("dupes",             True)),
+        "missing_datetime":  bool(cfg_quar.get("missing_datetime",  True)),
+    }
+
+
 # ---------- File helpers ----------
 
 def sha256_file(p: Path, bufsize: int = 1024*1024) -> str:
@@ -165,8 +184,7 @@ def is_supported_media(p: Path) -> bool:
     """Return True if file has one of the supported media extensions."""
     return p.is_file() and p.suffix.lower() in SUPPORTED_EXT
 
-# EXIF-only date parsing
-# Only capture/camera-origin dates. No filesystem dates.
+# Only capture/camera-origin dates. (File dates optionally added via flag)
 _DATE_KEYS = [
     "DateTimeOriginal",
     "CreateDate",           # EXIF create
@@ -175,8 +193,6 @@ _DATE_KEYS = [
     "QuickTime:CreateDate", # QuickTime atom
     "QuickTime:CreationDate"
 ]
-
-
 
 _dt_re = re.compile(
     r"^(?P<y>\d{4}):(?P<m>\d{2}):(?P<d>\d{2})[ T]"
@@ -199,7 +215,7 @@ def _parse_exif_dt(s: str) -> Optional[datetime]:
         elif tz == "Z":
             return datetime.fromisoformat(dt.strftime("%Y-%m-%dT%H:%M:%S") + "+00:00")
         return dt
-    # ISO fallback (still EXIF-originated strings for some containers)
+    # ISO fallback (some containers already ISO-like)
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
@@ -308,6 +324,7 @@ def maybe_quarantine(src: Path, reason: str, ingest_id: str, extra: Optional[str
     else:
         log(f"QUARANTINE FAILED for {src} ({reason})")
 
+
 # ---------- DB ops ----------
 
 def begin_ingest(conn: sqlite3.Connection, source: str, note: Optional[str] = None) -> str:
@@ -394,6 +411,9 @@ def already_finalized(conn: sqlite3.Connection, hash_hex: str) -> bool:
     )
     return cur.fetchone() is not None
 
+
+# ---------- Date from filename + resolver ----------
+
 def _taken_from_filename(name: str) -> Optional[datetime]:
     """
     Parse common filename timestamp patterns and return a datetime, or None.
@@ -438,6 +458,23 @@ def _taken_from_filename(name: str) -> Optional[datetime]:
 
     return None
 
+def resolve_taken_at(meta: dict, filename: str, allow_filename_dates: bool) -> Optional[str]:
+    """
+    Decide the capture time:
+      1) EXIF/QuickTime tags (strict)
+      2) filename-derived (only if allow_filename_dates=True)
+      -> return ISO8601 string or None
+    """
+    # 1) strict EXIF/QuickTime
+    t = extract_taken_at_exif_only(meta)
+    if t:
+        return t
+    # 2) optional filename fallback
+    if allow_filename_dates:
+        dt = _taken_from_filename(filename)
+        if dt:
+            return dt.isoformat()
+    return None
 
 
 # ---------- Ingest core ----------
@@ -464,14 +501,14 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
 
                 # junk files and AppleDouble resource forks
                 if name in JUNK_FILES or any(name.startswith(pref) for pref in JUNK_PREFIXES):
-                    if QUARANTINE_JUNK:
+                    if QUAR.get("junk", True):
                         maybe_quarantine(p, "junk", ingest_id, extra=("appledouble" if name.startswith("._") else "system_file"))
                         quarantined += 1
                     continue
 
                 # unsupported extensions
                 if not is_supported_media(p):
-                    if QUARANTINE_UNSUPPORTED:
+                    if QUAR.get("unsupported_ext", True):
                         maybe_quarantine(p, "unsupported_ext", ingest_id, extra=p.suffix.lower())
                         quarantined += 1
                     continue
@@ -482,13 +519,13 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                 try:
                     size = p.stat().st_size
                 except Exception as e:
-                    if QUARANTINE_STAT_ERROR:
+                    if QUAR.get("stat_error", True):
                         maybe_quarantine(p, "stat_error", ingest_id, extra=str(e))
                         quarantined += 1
                     continue
 
                 if size == 0:
-                    if QUARANTINE_ZERO_BYTE:
+                    if QUAR.get("zero_bytes", True):
                         maybe_quarantine(p, "zero_bytes", ingest_id)
                         quarantined += 1
                     continue
@@ -499,25 +536,15 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                 hint = last_meaningful_folder(p.parent)
 
                 # -------- capture time resolution --------
-                # 1) EXIF/QuickTime tags (strict by default)
-                taken_at = extract_taken_at_exif_only(meta)
-
-                # 2) Optional filename-derived fallback (only if flag enabled)
-                if not taken_at and ALLOW_FILENAME_DATES:
-                    fn_dt = _taken_from_filename(name)  # make sure you added this helper
-                    if fn_dt:
-                        taken_at = fn_dt.isoformat()
-
-                # 3) Still nothing? quarantine
+                taken_at = resolve_taken_at(meta, name, ALLOW_FILENAME_DATES)
                 if not taken_at:
-                    if QUARANTINE_MISSING_DATETIME:
-                        extra_msg = "no capture date (exif/qt"
-                        if ALLOW_FILENAME_DATES:
-                            extra_msg += "/filename"
-                        extra_msg += ")"
-                        maybe_quarantine(p, "missing_datetime", ingest_id, extra=extra_msg)
+                    reason = "no capture date (exif/qt" + ("/filename" if ALLOW_FILENAME_DATES else "") + ")"
+                    if QUAR.get("missing_datetime", True):
+                        maybe_quarantine(p, "missing_datetime", ingest_id, extra=reason)
                         quarantined += 1
-                        continue
+                    else:
+                        log(f"SKIP missing_datetime: {p} ({reason})")
+                    continue
                 # -----------------------------------------
 
                 media_row = {
@@ -540,10 +567,11 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                 mid, current_state, current_canon = upsert_media(conn, media_row)
                 insert_sighting(conn, mid, p, name, source_label, hint, ingest_id)
 
+                # already in library
                 if already_finalized(conn, h):
                     skipped_dupe += 1
                     log(f"= DUP in library: {p} ({h[:8]})")
-                    if QUARANTINE_DUPES:
+                    if QUAR.get("dupes", True):
                         maybe_quarantine(p, "duplicate_in_library", ingest_id)
                         quarantined += 1
                     continue
@@ -592,7 +620,7 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                                 pass
                         except Exception as e2:
                             moved_ok = False
-                            if QUARANTINE_MOVE_FAILURE:
+                            if QUAR.get("move_failed", True):
                                 maybe_quarantine(p, "move_failed", ingest_id, extra=f"{e1} | {e2}")
                                 quarantined += 1
 
@@ -615,15 +643,28 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
 # ---------- Main ----------
 
 def main():
-    parser = argparse.ArgumentParser(description="Pixarr: ingest media from staging folders (EXIF-only timestamps).")
+    # Load config first
+    cfg = load_config(repo_root() / "pixarr.toml")
+
+    # Read defaults from config (fall back to current behavior)
+    cfg_paths = cfg.get("paths", {})
+    cfg_ingest = cfg.get("ingest", {})
+    cfg_quar = cfg.get("quarantine", {})
+
+    parser = argparse.ArgumentParser(description="Pixarr: ingest media from staging folders.")
     parser.add_argument("sources", nargs="*", help="Subset of sources to ingest (pc, other, icloud, sdcard)")
     parser.add_argument("-n", "--note", help="Optional note to attach to this ingest batch")
-    parser.add_argument("--write", action="store_true", help="Perform moves/copies (default is dry-run)")
-    parser.add_argument("--data-dir", default=str(repo_root() / "data"),
+    parser.add_argument("--write", action="store_true",
+                        default=not cfg_ingest.get("dry_run_default", True),
+                        help="Perform moves/copies (default is dry-run)")
+    parser.add_argument("--data-dir",
+                        default=str(Path(cfg_paths.get("data_dir", str(repo_root() / "data")))),
                         help="Root data directory (default: ./data under repo)")
     parser.add_argument("--allow-file-dates", action="store_true",
+                        default=bool(cfg_ingest.get("allow_file_dates", False)),
                         help="Allow ModifyDate/FileModifyDate as capture time fallback")
     parser.add_argument("--allow-filename-dates", action="store_true",
+                        default=bool(cfg_ingest.get("allow_filename_dates", False)),
                         help="Allow filename-derived timestamps as fallback (e.g., PHOTO-YYYY-MM-DD-HH-MM-SS.jpg)")
 
     args = parser.parse_args()
@@ -633,16 +674,19 @@ def main():
         "DateTimeOriginal", "CreateDate", "MediaCreateDate", "TrackCreateDate",
         "QuickTime:CreateDate", "QuickTime:CreationDate"
     ]
-    if args.allow_file_dates:  # <-- underscores, not hyphen
+    if args.allow_file_dates:
         base_keys += ["ModifyDate", "FileModifyDate"]
 
-    # Update the global used by extract_taken_at_exif_only()
     global _DATE_KEYS
     _DATE_KEYS = base_keys
 
     # Expose filename-dates flag to the ingest loop
     global ALLOW_FILENAME_DATES
-    ALLOW_FILENAME_DATES = args.allow_filename_dates  # <-- underscores
+    ALLOW_FILENAME_DATES = args.allow_filename_dates
+
+    # Apply quarantine settings from config
+    global QUAR
+    QUAR = build_quarantine_cfg(cfg_quar)
 
     # Paths / bootstrap
     base = Path(args.data_dir).resolve()
@@ -655,12 +699,17 @@ def main():
     if not DB_PATH.exists():
         ensure_db()
 
+    # exiftool check
+    ensure_exiftool()
+
     REVIEW_ROOT.mkdir(parents=True, exist_ok=True)
     QUARANTINE_ROOT.mkdir(parents=True, exist_ok=True)
 
     mode = "DRY-RUN" if DRY_RUN else "WRITE"
     log(f"Mode: {mode}")
     log(f"DATA_DIR = {DATA_DIR}")
+    log(f"Effective quarantine: {QUAR}")
+    log(f"allow_filename_dates={ALLOW_FILENAME_DATES}, allow_file_dates={'ModifyDate' in _DATE_KEYS}")
 
     t0 = time.perf_counter()
 
@@ -668,9 +717,9 @@ def main():
     ensure_column(conn, "sightings", "folder_hint", "TEXT")
     ensure_column(conn, "sightings", "ingest_id", "TEXT")
 
-    wanted = set(args.sources)
+    wanted = set(args.sources)  # labels like 'pc', 'other', etc.
     for label, path in STAGING_SOURCES.items():
-        short = label.split("/", 1)[-1]
+        short = label.split("/", 1)[-1]  # 'pc' from 'Staging/pc'
         if wanted and short not in wanted and label not in wanted:
             continue
         ingest_one_source(conn, label, path, note=args.note)
@@ -680,6 +729,7 @@ def main():
     elapsed = time.perf_counter() - t0
     log(f"\n=== Ingest complete. Total time: {elapsed:.1f} seconds ===")
 
+    # quick peek at review queue
     conn2 = open_db()
     try:
         rows = conn2.execute("SELECT id, canonical_path, taken_at FROM v_review_queue LIMIT 10").fetchall()
@@ -691,6 +741,7 @@ def main():
         log(f"(note) could not read v_review_queue: {e}")
     finally:
         conn2.close()
+
 
 if __name__ == "__main__":
     main()

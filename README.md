@@ -1,77 +1,98 @@
 # Pixarr
 
-**Pixarr** is a personal photo & video pipeline inspired by Radarr/Sonarr/Lidarr.
-It ingests raw media from *Staging*, deduplicates by content hash, and moves files through a review → library workflow.
+Lightweight ingest for personal photos/videos (like Radarr/Sonarr but for memories).
+Scans `data/media/Staging/*`, derives a capture time, **renames** into a canonical form, and moves items to `Review/`.
+**Note:** We do **not** modify EXIF yet—see the Roadmap.
 
-## Features
-
-* Ingest from multiple staging sources (`pc`, `icloud`, `sdcard`, `other`)
-* Deduplication via SHA-256 (one row per unique binary)
-* Light EXIF parsing (timestamps, GPS, camera info)
-* Quarantine junk, unsupported, zero-byte, or duplicate files
-* SQLite database with full schema for provenance, tagging, and audit trails
-* Dry-run by default; safe to test before committing moves
-
-## Directory Structure
+## Folder layout
 
 ```
-Pixarr/
-├── scripts/ingest_pass.py   # main ingest script
-├── db/schema.sql            # canonical DB schema
-├── data/                    # created on first run (ignored in git)
-│   ├── media/
-│   │   ├── Staging/{pc,icloud,sdcard,other}
-│   │   ├── Review/
-│   │   ├── Library/
-│   │   └── Quarantine/
-│   └── db/app.sqlite3
+data/
+  db/app.sqlite3
+  media/
+    Staging/{pc,icloud,sdcard,other}
+    Review/
+    Library/
+    Quarantine/
 ```
 
-## Quick Start
+## Install
 
-1. Install dependencies:
+```bash
+python -m pip install -r requirements.txt   # if you’re tracking deps
+# macOS: install exiftool
+brew install exiftool
+```
 
-   * Python 3.10+
-   * [ExifTool](https://exiftool.org/)
+## Config (optional)
 
-2. Run a dry ingest (default):
+Create `pixarr.toml` (or copy from `pixarr.example.toml`):
 
-   ```bash
-   python scripts/ingest_pass.py
-   ```
+```toml
+[paths]
+data_dir = "/Volumes/Data/Pixarr/data"
 
-3. Actually move files into **Review/**:
+[ingest]
+dry_run_default = true
+allow_filename_dates = false
+allow_file_dates = false
 
-   ```bash
-   python scripts/ingest_pass.py --write
-   ```
+[quarantine]
+missing_datetime = true
+junk = true
+unsupported_ext = true
+zero_bytes = true
+stat_error = true
+move_failed = true
+dupes = true
+```
 
-4. Optional: point at a different storage location:
+CLI flags override the config for that run.
 
-   ```bash
-   python scripts/ingest_pass.py --data-dir "/Volumes/Data/Memories" --write
-   ```
+## Run
 
-## Notes
+Dry run (default):
 
-* Files never move directly into `Library/` — only into `Review/`.
-* Deduplication is based on SHA-256 stored in the database.
-* Quarantined files are written to `Quarantine/<reason>/` with a JSON sidecar.
+```bash
+python scripts/ingest_pass.py other -n "first dry scan"
+```
 
+Allow filename-derived timestamps:
 
-### 📌 Roadmap / TODOs
+```bash
+python scripts/ingest_pass.py other --allow-filename-dates
+```
 
-Pixarr is still under active development. Upcoming work includes:
+Write mode:
 
-* [ ] **iCloud downloads** — integrate [`icloudpd`](https://github.com/icloud-photos-downloader/icloud_photos_downloader) for syncing.
-* [ ] **Handle bad years/dates** — detect and quarantine/correct files with invalid or implausible timestamps.
-* [ ] **Cron jobs** — automate ingestion and housekeeping tasks.
-* [ ] **Library integrity checks** — handle files that are moved/deleted from `Library/` (e.g., reorganized by year).
-* [ ] **EXIF corrections on promote** — when moving from `Review/` → `Library/`, update/correct EXIF (date, tags, etc.).
-* [ ] **Logging** — write structured logs (file + stdout) for ingestion and moves.
-* [ ] **Post-ingest cleanup**
+```bash
+python scripts/ingest_pass.py other --write
+```
 
-  * Option A: delete source files after ingestion
-  * Option B: move to a `processed/` folder
-  * Option C: move skipped/error files to a dedicated `error/` folder
-* [ ] **Correction pipeline** — for media missing reliable capture date (no EXIF/QuickTime, filename-derived, or mtime fallback).
+## Naming policy
+
+* Canonical filename: `YYYY-MM-DD_HH-MM-SS_<hash8>.<ext>`
+* Timestamp source order:
+
+  1. **EXIF/QuickTime** capture dates
+  2. **(optional)** filename-derived dates (`--allow-filename-dates`)
+  3. File dates are off by default; enable with `--allow-file-dates`
+
+## Quarantine policy
+
+Config-driven (`[quarantine]` in TOML). Typical buckets:
+
+* `missing_datetime`, `junk`, `unsupported_ext`, `zero_bytes`, `stat_error`, `move_failed`, `duplicate_in_library`.
+
+## Roadmap / Action items
+
+* **Write EXIF/XMP during Review → Library promotion.**
+
+  * Backfill `DateTimeOriginal` / QuickTime creation atom from the canonical filename when EXIF is missing or wrong.
+  * Persist timezone offsets and corrections.
+* iCloud imports (icloudpd) and monitoring.
+* Reconcile: handle files moved/deleted from `Library/`.
+* Logging to file.
+* Post-ingest cleanup (e.g., move processed/ignored files).
+* Correction pipeline for anything with **no EXIF**, **no QuickTime date**, **filename-derived**, or **mtime fallback**.
+
