@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# macOS cruft
+.DS_Store
+.AppleDouble
+.Spotlight-V100
+.Trashes
+
+# Databases and journals
+data/db/*.sqlite3
+data/db/*.db
+data/db/*.sqlite3-*
+data/db/*.db-*
+
+# Media directories (large user files, not source code)
+data/media/Library/
+data/media/Review/
+data/media/Staging/
+data/media/Quarantine/
+
+# Logs / temp
+*.log
+*.tmp
