@@ -57,3 +57,21 @@ Pixarr/
 * Files never move directly into `Library/` — only into `Review/`.
 * Deduplication is based on SHA-256 stored in the database.
 * Quarantined files are written to `Quarantine/<reason>/` with a JSON sidecar.
+
+
+### 📌 Roadmap / TODOs
+
+Pixarr is still under active development. Upcoming work includes:
+
+* [ ] **iCloud downloads** — integrate [`icloudpd`](https://github.com/icloud-photos-downloader/icloud_photos_downloader) for syncing.
+* [ ] **Handle bad years/dates** — detect and quarantine/correct files with invalid or implausible timestamps.
+* [ ] **Cron jobs** — automate ingestion and housekeeping tasks.
+* [ ] **Library integrity checks** — handle files that are moved/deleted from `Library/` (e.g., reorganized by year).
+* [ ] **EXIF corrections on promote** — when moving from `Review/` → `Library/`, update/correct EXIF (date, tags, etc.).
+* [ ] **Logging** — write structured logs (file + stdout) for ingestion and moves.
+* [ ] **Post-ingest cleanup**
+
+  * Option A: delete source files after ingestion
+  * Option B: move to a `processed/` folder
+  * Option C: move skipped/error files to a dedicated `error/` folder
+* [ ] **Correction pipeline** — for media missing reliable capture date (no EXIF/QuickTime, filename-derived, or mtime fallback).
