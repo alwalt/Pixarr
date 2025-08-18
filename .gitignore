@@ -25,7 +25,6 @@ data/db/*.db-*
 # Configuration files
 pixarr.toml
 
-
 # Media directories (large user files, not source code)
 data/media/Library/
 data/media/Review/
