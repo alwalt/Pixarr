@@ -26,3 +26,4 @@ def test_filename_patterns():
     assert _taken_from_filename("IMG_20240710_200842.HEIC") == datetime(2024,7,10,20,8,42)
     assert _taken_from_filename("WhatsApp Image 2024-07-10 at 20.08.42.jpeg") == datetime(2024,7,10,20,8,42)
     assert _taken_from_filename("PXL_20240710_200842123.jpg") == datetime(2024,7,10,20,8,42)
+
