@@ -30,6 +30,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, Dict
+from collections import defaultdict, Counter
+
 
 # ---------- Global toggles ----------
 DRY_RUN = True  # overridden by --write
@@ -125,6 +127,52 @@ def pathize(base: Path) -> None:
         "Staging/sdcard": STAGING_BASE / "sdcard",
     }
     SCHEMA_PATH = repo_root() / "db" / "schema.sql"
+
+def resolve_source_tokens(tokens: list[str]) -> list[tuple[str, Path]]:
+    """
+    Turn CLI tokens into (label, path) pairs.
+    Accepts:
+      - 'pc' | 'other' | 'icloud' | 'sdcard'
+      - 'Staging/pc' etc.
+      - Subpaths like 'other/trip1' (relative to data/media/Staging)
+      - Absolute/relative paths (treated as custom roots)
+    """
+    if not tokens:
+        return list(STAGING_SOURCES.items())
+
+    out, seen = [], set()
+    staging_base = DATA_DIR / "media" / "Staging"
+
+    for tok in tokens:
+        tok_stripped = tok.strip()
+
+        if tok_stripped in ("pc", "other", "icloud", "sdcard"):
+            label = f"Staging/{tok_stripped}"
+            path = STAGING_SOURCES[label]
+
+        elif tok_stripped in STAGING_SOURCES:
+            label = tok_stripped
+            path = STAGING_SOURCES[label]
+
+        elif "/" in tok_stripped and not tok_stripped.startswith("/"):
+            # subdir under Staging, e.g. 'other/trip1'
+            path = (staging_base / tok_stripped).resolve()
+            label = f"Staging/{tok_stripped}"
+
+        else:
+            # absolute or relative filesystem path
+            p = Path(tok_stripped).expanduser()
+            if not p.is_absolute():
+                p = (staging_base / tok_stripped).resolve()
+            label = f"Custom:{tok_stripped}"
+            path = p
+
+        key = (label, str(path))
+        if key not in seen:
+            out.append((label, path))
+            seen.add(key)
+
+    return out
 
 def load_config(path: Path) -> dict:
     """Load pixarr.toml if present; return dict of settings."""
@@ -480,16 +528,27 @@ def resolve_taken_at(meta: dict, filename: str, allow_filename_dates: bool) -> O
 # ---------- Ingest core ----------
 
 def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root: Path, note: Optional[str] = None):
-    """Run a full ingest pass for one staging root."""
+    """Run a full ingest pass for one staging root and return stats for end-of-run summary."""
+    stats = {
+        "label": source_label,
+        "path": str(staging_root),
+        "ingest_id": None,
+        "scanned": 0,
+        "moved": 0,           # planned in dry-run, actual in write mode
+        "updated": 0,
+        "skipped_dupe": 0,
+        "quarantined": 0,
+        "q_counts": defaultdict(int),  # reason -> count
+    }
+
     if not staging_root.exists():
         log(f"SKIP {source_label}: path not found -> {staging_root}")
-        return
+        return stats
 
     ingest_id = begin_ingest(conn, source_label, note)
+    stats["ingest_id"] = ingest_id
     log(f"\n=== {source_label} ===")
     log(f"Started ingest batch: {ingest_id} ({staging_root})")
-
-    scanned = moved = skipped_dupe = updated = quarantined = 0
 
     try:
         for root, dirs, files in os.walk(staging_root):
@@ -502,32 +561,36 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                 # junk files and AppleDouble resource forks
                 if name in JUNK_FILES or any(name.startswith(pref) for pref in JUNK_PREFIXES):
                     if QUAR.get("junk", True):
+                        stats["q_counts"]["junk"] += 1
                         maybe_quarantine(p, "junk", ingest_id, extra=("appledouble" if name.startswith("._") else "system_file"))
-                        quarantined += 1
+                        stats["quarantined"] += 1
                     continue
 
                 # unsupported extensions
                 if not is_supported_media(p):
                     if QUAR.get("unsupported_ext", True):
+                        stats["q_counts"]["unsupported_ext"] += 1
                         maybe_quarantine(p, "unsupported_ext", ingest_id, extra=p.suffix.lower())
-                        quarantined += 1
+                        stats["quarantined"] += 1
                     continue
 
-                scanned += 1
+                stats["scanned"] += 1
 
                 # per-file logic
                 try:
                     size = p.stat().st_size
                 except Exception as e:
                     if QUAR.get("stat_error", True):
+                        stats["q_counts"]["stat_error"] += 1
                         maybe_quarantine(p, "stat_error", ingest_id, extra=str(e))
-                        quarantined += 1
+                        stats["quarantined"] += 1
                     continue
 
                 if size == 0:
                     if QUAR.get("zero_bytes", True):
+                        stats["q_counts"]["zero_bytes"] += 1
                         maybe_quarantine(p, "zero_bytes", ingest_id)
-                        quarantined += 1
+                        stats["quarantined"] += 1
                     continue
 
                 h = sha256_file(p)
@@ -540,8 +603,9 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                 if not taken_at:
                     reason = "no capture date (exif/qt" + ("/filename" if ALLOW_FILENAME_DATES else "") + ")"
                     if QUAR.get("missing_datetime", True):
+                        stats["q_counts"]["missing_datetime"] += 1
                         maybe_quarantine(p, "missing_datetime", ingest_id, extra=reason)
-                        quarantined += 1
+                        stats["quarantined"] += 1
                     else:
                         log(f"SKIP missing_datetime: {p} ({reason})")
                     continue
@@ -569,11 +633,12 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
 
                 # already in library
                 if already_finalized(conn, h):
-                    skipped_dupe += 1
+                    stats["skipped_dupe"] += 1
                     log(f"= DUP in library: {p} ({h[:8]})")
                     if QUAR.get("dupes", True):
+                        stats["q_counts"]["duplicate_in_library"] += 1
                         maybe_quarantine(p, "duplicate_in_library", ingest_id)
-                        quarantined += 1
+                        stats["quarantined"] += 1
                     continue
 
                 if current_state in ("review", "library") and current_canon:
@@ -583,7 +648,7 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                         canon_missing = True
 
                     if not canon_missing:
-                        updated += 1
+                        stats["updated"] += 1
                         now = datetime.utcnow().isoformat()
                         conn.execute(
                             "UPDATE media SET last_verified_at=?, updated_at=? WHERE id=?",
@@ -596,7 +661,7 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                         log(f"! Missing on disk (review); will requeue -> {current_canon}")
                     else:
                         log(f"! Missing on disk (library); leaving for reconcile -> {current_canon}")
-                        skipped_dupe += 1
+                        stats["skipped_dupe"] += 1
                         continue
 
                 fname = canonical_name(taken_at, h, ext)
@@ -604,6 +669,7 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
 
                 if DRY_RUN:
                     log(f"[DRY] MOVE {p} -> {dest}")
+                    stats["moved"] += 1
                 else:
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     moved_ok = False
@@ -621,8 +687,9 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                         except Exception as e2:
                             moved_ok = False
                             if QUAR.get("move_failed", True):
+                                stats["q_counts"]["move_failed"] += 1
                                 maybe_quarantine(p, "move_failed", ingest_id, extra=f"{e1} | {e2}")
-                                quarantined += 1
+                                stats["quarantined"] += 1
 
                     if moved_ok:
                         now = datetime.utcnow().isoformat()
@@ -630,15 +697,16 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                             "UPDATE media SET state='review', canonical_path=?, updated_at=?, last_verified_at=? WHERE id=?",
                             (str(dest), now, now, mid),
                         )
-                        moved += 1
+                        stats["moved"] += 1
 
                 conn.commit()
-
-        log(f"Summary {source_label}: scanned={scanned}, moved={'(dry)' if DRY_RUN else moved}, updated={updated}, skipped_dupe={skipped_dupe}, quarantined={quarantined}")
 
     finally:
         finish_ingest(conn, ingest_id)
 
+    # Solidify defaultdict for JSON-like printing
+    stats["q_counts"] = dict(stats["q_counts"])
+    return stats
 
 # ---------- Main ----------
 
@@ -717,30 +785,114 @@ def main():
     ensure_column(conn, "sightings", "folder_hint", "TEXT")
     ensure_column(conn, "sightings", "ingest_id", "TEXT")
 
-    wanted = set(args.sources)  # labels like 'pc', 'other', etc.
-    for label, path in STAGING_SOURCES.items():
-        short = label.split("/", 1)[-1]  # 'pc' from 'Staging/pc'
-        if wanted and short not in wanted and label not in wanted:
-            continue
-        ingest_one_source(conn, label, path, note=args.note)
+    # pick sources/paths (works with 'pc', 'other/trip1', absolute paths, etc.)
+    try:
+        selected = resolve_source_tokens(args.sources)  # if you added this helper earlier
+    except NameError:
+        # fallback to the old behavior if you didn't add resolve_source_tokens yet
+        wanted = set(args.sources)
+        selected = []
+        for label, path in STAGING_SOURCES.items():
+            short = label.split("/", 1)[-1]
+            if wanted and short not in wanted and label not in wanted:
+                continue
+            selected.append((label, path))
+
+    all_stats = []
+    for label, path in selected:
+        stats = ingest_one_source(conn, label, path, note=args.note)
+        all_stats.append(stats)
 
     conn.close()
 
     elapsed = time.perf_counter() - t0
-    log(f"\n=== Ingest complete. Total time: {elapsed:.1f} seconds ===")
 
-    # quick peek at review queue
+    # ---------- END-OF-RUN SUMMARY ----------
+    log("\n=== Run summary (grouped) ===")
+    for s in all_stats:
+        moved_field = f"{s['moved']}(dry)" if DRY_RUN else str(s["moved"])
+        log(
+            f"Summary {s['label']}: "
+            f"scanned={s['scanned']}, moved={moved_field}, updated={s['updated']}, "
+            f"skipped_dupe={s['skipped_dupe']}, quarantined={s['quarantined']}"
+        )
+
+    # totals
+    totals = {
+        "scanned": sum(s["scanned"] for s in all_stats),
+        "moved": sum(s["moved"] for s in all_stats),
+        "updated": sum(s["updated"] for s in all_stats),
+        "skipped_dupe": sum(s["skipped_dupe"] for s in all_stats),
+        "quarantined": sum(s["quarantined"] for s in all_stats),
+    }
+    moved_total_field = f"{totals['moved']}(dry)" if DRY_RUN else str(totals["moved"])
+    log(
+        f"TOTALS: scanned={totals['scanned']}, moved={moved_total_field}, "
+        f"updated={totals['updated']}, skipped_dupe={totals['skipped_dupe']}, "
+        f"quarantined={totals['quarantined']}"
+    )
+
+    # aggregate quarantine reasons
+    q_agg = Counter()
+    for s in all_stats:
+        q_agg.update(s["q_counts"])
+    if q_agg:
+        log("Quarantine reasons this run:")
+        for reason, cnt in q_agg.most_common():
+            log(f"  - {reason}: {cnt}")
+
+    # batch info from DB with a few examples per batch
     conn2 = open_db()
     try:
-        rows = conn2.execute("SELECT id, canonical_path, taken_at FROM v_review_queue LIMIT 10").fetchall()
-        if rows:
-            log("\nSample Review queue:")
-            for rid, path, t in rows:
-                log(f"  id={rid[:8]}… taken_at={t} path={path}")
-    except sqlite3.Error as e:
-        log(f"(note) could not read v_review_queue: {e}")
+        log("\nBatches created:")
+        for s in all_stats:
+            if not s["ingest_id"]:
+                continue
+            iid = s["ingest_id"]
+            row = conn2.execute(
+                "SELECT source, started_at, finished_at, notes FROM ingests WHERE id=?",
+                (iid,)
+            ).fetchone()
+            if not row:
+                continue
+            src, started, finished, notes = row
+            items = conn2.execute(
+                "SELECT COUNT(*) FROM sightings WHERE ingest_id=?",
+                (iid,)
+            ).fetchone()[0]
+            log(f"  {iid[:8]}…  {src}  items={items}  started={started or '-'}  finished={finished or '-'}  note={notes or ''}")
+
+            # last few examples seen in this batch
+            examples = conn2.execute(
+                """
+                SELECT s.filename, m.taken_at, m.canonical_path
+                FROM sightings s
+                JOIN media m ON s.media_id = m.id
+                WHERE s.ingest_id=?
+                ORDER BY s.seen_at DESC
+                LIMIT 3
+                """,
+                (iid,)
+            ).fetchall()
+            for fn, t, cpath in examples:
+                log(f"    - {fn} | taken_at={t} | path={cpath}")
     finally:
         conn2.close()
+
+    log(f"\n=== Ingest complete. Total time: {elapsed:.1f} seconds ===")
+
+    # # quick peek at review queue
+    # conn2 = open_db()
+    # try:
+    #     rows = conn2.execute("SELECT id, canonical_path, taken_at FROM v_review_queue LIMIT 10").fetchall()
+    #     if rows:
+    #         log("\nSample Review queue:")
+    #         for rid, path, t in rows:
+    #             log(f"  id={rid[:8]}… taken_at={t} path={path}")
+    # except sqlite3.Error as e:
+    #     log(f"(note) could not read v_review_queue: {e}")
+    # finally:
+    #     conn2.close()
 
 
 if __name__ == "__main__":
