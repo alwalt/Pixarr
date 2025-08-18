@@ -2,24 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-Pixarr — ingest pass over a Staging subfolder.
+Pixarr — ingest pass over Staging subfolders.
 
-What it does:
-- Auto-bootstraps data dirs and SQLite DB from db/schema.sql on first run.
-- Creates a new batch row in `ingests` and uses its UUID for all rows this run.
-- Recursively scans STAGING_ROOT for supported media.
-- For each file: compute SHA-256, read light EXIF via exiftool,
-  upsert into `media`, record a `sightings` row (with ingest_id),
-  and plan a canonical filename for Review/.
-- Dry-run by default so you can inspect changes before moving. Use --write to perform moves.
-
-Idempotent:
-- One `media` row per hash. Re-running will only add `sightings`.
-- If a file's content is already in `library`, we only record a sighting (no move).
+Changes in this build:
+- EXIF-only: taken_at comes ONLY from EXIF/QuickTime datetime tags.
+- Hard fail without exiftool.
+- Files with no EXIF/QuickTime capture date are QUARANTINED to Quarantine/missing_datetime/.
+- Dry-run by default; use --write to actually move files to Review/.
 
 Requirements:
-- exiftool (brew install exiftool / apt install libimage-exiftool-perl)
 - Python 3.10+
+- exiftool on PATH (hard requirement)
 """
 
 import os
@@ -29,12 +22,13 @@ import json
 import sqlite3
 import hashlib
 import subprocess
-from datetime import datetime
-from pathlib import Path
-from typing import Optional, Tuple, Dict
 import time
 import argparse
 import shutil
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Tuple, Dict
 
 # ---------- Global toggles ----------
 DRY_RUN = True  # default; overridden by --write
@@ -56,7 +50,9 @@ QUARANTINE_UNSUPPORTED  = True
 QUARANTINE_ZERO_BYTE    = True
 QUARANTINE_STAT_ERROR   = True
 QUARANTINE_MOVE_FAILURE = True
-QUARANTINE_DUPES        = True  # set True if you want to sweep dupes into Quarantine too
+QUARANTINE_DUPES        = True  # dupes of existing library content
+# NEW: quarantine when no EXIF/QuickTime capture date is present
+QUARANTINE_MISSING_DATETIME = True
 
 # ---------- Paths configured at runtime ----------
 DATA_DIR: Path
@@ -65,6 +61,12 @@ REVIEW_ROOT: Path
 QUARANTINE_ROOT: Path
 STAGING_SOURCES: Dict[str, Path]
 SCHEMA_PATH: Path
+
+# ---------- exiftool (hard requirement) ----------
+EXIFTOOL_PATH = shutil.which("exiftool")
+if not EXIFTOOL_PATH:
+    sys.stderr.write("FATAL: exiftool not found on PATH. Install it first (e.g., Homebrew: brew install exiftool).\n")
+    sys.exit(1)
 
 # ---------- Utilities ----------
 
@@ -77,8 +79,18 @@ def log(msg: str) -> None:
 
 def ensure_dirs() -> None:
     (DATA_DIR / "db").mkdir(parents=True, exist_ok=True)
-    # Media roots
-    for d in ["Staging/pc", "Staging/other", "Staging/icloud", "Staging/sdcard", "Review", "Library", "Quarantine"]:
+    for d in [
+        "Staging/pc", "Staging/other", "Staging/icloud", "Staging/sdcard",
+        "Review", "Library", "Quarantine",
+        # subfolder for our missing-date quarantine class
+        "Quarantine/missing_datetime",
+        "Quarantine/junk",
+        "Quarantine/unsupported_ext",
+        "Quarantine/zero_bytes",
+        "Quarantine/stat_error",
+        "Quarantine/move_failed",
+        "Quarantine/duplicate_in_library",
+    ]:
         (DATA_DIR / "media" / d).mkdir(parents=True, exist_ok=True)
 
 def ensure_db() -> None:
@@ -133,63 +145,72 @@ def sha256_file(p: Path, bufsize: int = 1024*1024) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-
-EXIFTOOL_PATH = shutil.which("exiftool")
-if not EXIFTOOL_PATH:
-    sys.stderr.write("FATAL: exiftool not found on PATH. Please install it (e.g., brew install exiftool).\n")
-    sys.exit(1)
-
 def exiftool_json(p: Path) -> dict:
     """Return metadata dict from exiftool -j (or {})."""
     try:
         out = subprocess.check_output(
             [EXIFTOOL_PATH, "-j", "-n", "-api", "largefilesupport=1", str(p)],
             stderr=subprocess.DEVNULL,
-            timeout=15,
+            timeout=20,
         )
         arr = json.loads(out.decode("utf-8", errors="ignore"))
         return arr[0] if arr else {}
     except Exception:
         return {}
 
+def is_supported_media(p: Path) -> bool:
+    """Return True if file has one of the supported media extensions."""
+    return p.is_file() and p.suffix.lower() in SUPPORTED_EXT
 
-def extract_taken_at(meta: dict) -> Optional[str]:
-    """
-    Prefer EXIF DateTimeOriginal then CreateDate/Media/Track.
-    Normalize to ISO8601 without timezone (good enough for filenames).
-    """
-    candidates = [
-        meta.get("DateTimeOriginal"),
-        meta.get("CreateDate"),
-        meta.get("MediaCreateDate"),
-        meta.get("TrackCreateDate"),
-        meta.get("QuickTime:CreateDate"),
-    ]
-    for raw in candidates:
-        if not raw:
-            continue
-        s = str(raw).strip()
-        # exiftool typical format: "YYYY:MM:DD HH:MM:SS"
-        if len(s) >= 19 and s[4] == ":" and s[7] == ":" and s[10] == " ":
+# EXIF-only date parsing
+# Only capture/camera-origin dates. No filesystem dates.
+_DATE_KEYS = [
+    "DateTimeOriginal",
+    "CreateDate",           # EXIF create
+    "MediaCreateDate",      # some video containers
+    "TrackCreateDate",      # some MP4/MOV tracks
+    "QuickTime:CreateDate", # QuickTime atom
+    "QuickTime:CreationDate"
+]
+
+
+
+_dt_re = re.compile(
+    r"^(?P<y>\d{4}):(?P<m>\d{2}):(?P<d>\d{2})[ T]"
+    r"(?P<H>\d{2}):(?P<M>\d{2}):(?P<S>\d{2})"
+    r"(?:\.(?P<sub>\d+))?(?P<tz>Z|[+\-]\d{2}:?\d{2})?$"
+)
+
+def _parse_exif_dt(s: str) -> Optional[datetime]:
+    s = s.strip()
+    m = _dt_re.match(s)
+    if m:
+        dt = datetime.strptime(s[:19], "%Y:%m:%d %H:%M:%S")
+        tz = m.group("tz")
+        if tz and tz != "Z":
+            tz = tz if ":" in tz else (tz[:3] + ":" + tz[3:])
             try:
-                dt = datetime.strptime(s[:19], "%Y:%m:%d %H:%M:%S")
-                return dt.isoformat()
+                return datetime.fromisoformat(dt.strftime("%Y-%m-%dT%H:%M:%S") + tz)
             except Exception:
                 pass
-        # Already ISO?
-        try:
-            return datetime.fromisoformat(s.replace("Z", "+00:00")).isoformat()
-        except Exception:
-            pass
-    return None
-
-def extract_gps(meta: dict) -> Tuple[Optional[float], Optional[float]]:
-    lat = meta.get("GPSLatitude")
-    lon = meta.get("GPSLongitude")
+        elif tz == "Z":
+            return datetime.fromisoformat(dt.strftime("%Y-%m-%dT%H:%M:%S") + "+00:00")
+        return dt
+    # ISO fallback (still EXIF-originated strings for some containers)
     try:
-        return float(lat), float(lon)
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
-        return None, None
+        return None
+
+def extract_taken_at_exif_only(meta: dict) -> Optional[str]:
+    """Return taken_at only from EXIF/QuickTime tags. Otherwise None."""
+    for k in _DATE_KEYS:
+        v = meta.get(k)
+        if v:
+            dt = _parse_exif_dt(str(v))
+            if dt:
+                return dt.isoformat()
+    return None
 
 def last_meaningful_folder(path: Path) -> Optional[str]:
     """Pick last non-generic folder name for hinting."""
@@ -208,20 +229,11 @@ def uuid_from_hash(hash_hex: str) -> str:
     """Deterministic UUID from SHA-256 (stable per content)."""
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, hash_hex))
 
-def canonical_name(taken_at_iso: Optional[str], hash_hex: str, ext: str) -> str:
+def canonical_name(taken_at_iso: str, hash_hex: str, ext: str) -> str:
     """YYYY-MM-DD_HH-MM-SS_hashprefix.ext (hashprefix = first 8 chars)."""
-    if taken_at_iso:
-        try:
-            dt = datetime.fromisoformat(taken_at_iso.replace("Z", "+00:00"))
-            stamp = dt.strftime("%Y-%m-%d_%H-%M-%S")
-        except Exception:
-            stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    else:
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    dt = datetime.fromisoformat(taken_at_iso.replace("Z", "+00:00"))
+    stamp = dt.strftime("%Y-%m-%d_%H-%M-%S")
     return f"{stamp}_{hash_hex[:8]}{ext.lower()}"
-
-def is_supported_media(p: Path) -> bool:
-    return p.is_file() and p.suffix.lower() in SUPPORTED_EXT
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     """Add a column if it doesn't exist. Safe to call every run."""
@@ -246,7 +258,9 @@ def plan_nonclobber(dest_dir: Path, filename: str) -> Path:
 
 def _write_quarantine_sidecar(dest: Path, payload: dict) -> None:
     try:
-        (dest.parent / (dest.name + ".quarantine.json")).write_text(json.dumps(payload, indent=2))
+        (dest.parent / (dest.name + ".quarantine.json")).write_text(
+            json.dumps(payload, indent=2)
+        )
     except Exception:
         pass
 
@@ -432,10 +446,19 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
 
                 h = sha256_file(p)
                 meta = exiftool_json(p)
-                taken_at = extract_taken_at(meta)
-                gps_lat, gps_lon = extract_gps(meta)
                 ext = p.suffix.lower()
                 hint = last_meaningful_folder(p.parent)
+
+                # EXIF-only capture time
+                taken_at = extract_taken_at_exif_only(meta)
+                if not taken_at:
+                    if QUARANTINE_MISSING_DATETIME:
+                        maybe_quarantine(p, "missing_datetime", ingest_id, extra="no EXIF/QuickTime capture date")
+                        quarantined += 1
+                        continue
+                    else:
+                        # (Disabled in this build) could fall back here if desired
+                        pass
 
                 media_row = {
                     "id": uuid_from_hash(h),
@@ -445,8 +468,8 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                     "bytes": size,
                     "taken_at": taken_at,
                     "tz_offset": None,
-                    "gps_lat": gps_lat,
-                    "gps_lon": gps_lon,
+                    "gps_lat": meta.get("GPSLatitude") if meta.get("GPSLatitude") is not None else None,
+                    "gps_lon": meta.get("GPSLongitude") if meta.get("GPSLongitude") is not None else None,
                     "state": "review",
                     "canonical_path": None,
                     "added_at": datetime.utcnow().isoformat(),
@@ -466,14 +489,12 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                     continue
 
                 if current_state in ("review", "library") and current_canon:
-                    # Check if the file recorded in DB actually exists on disk
                     try:
                         canon_missing = not Path(current_canon).exists()
                     except Exception:
                         canon_missing = True
 
                     if not canon_missing:
-                        # File is present — keep current tracking & heartbeat
                         updated += 1
                         now = datetime.utcnow().isoformat()
                         conn.execute(
@@ -484,10 +505,8 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                         continue
 
                     if current_state == "review":
-                        # Review file was deleted — requeue it by proceeding to plan/move below
                         log(f"! Missing on disk (review); will requeue -> {current_canon}")
                     else:
-                        # Library file missing — handled by reconcile script, don’t recreate here
                         log(f"! Missing on disk (library); leaving for reconcile -> {current_canon}")
                         skipped_dupe += 1
                         continue
@@ -530,19 +549,34 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
         log(f"Summary {source_label}: scanned={scanned}, moved={'(dry)' if DRY_RUN else moved}, updated={updated}, skipped_dupe={skipped_dupe}, quarantined={quarantined}")
 
     finally:
-        # Always close the batch even if we crash/CTRL-C
         finish_ingest(conn, ingest_id)
 
 # ---------- Main ----------
 
 def main():
-    parser = argparse.ArgumentParser(description="Pixarr: ingest media from staging folders.")
+    parser = argparse.ArgumentParser(description="Pixarr: ingest media from staging folders (EXIF-only timestamps).")
     parser.add_argument("sources", nargs="*", help="Subset of sources to ingest (pc, other, icloud, sdcard)")
     parser.add_argument("-n", "--note", help="Optional note to attach to this ingest batch")
     parser.add_argument("--write", action="store_true", help="Perform moves/copies (default is dry-run)")
     parser.add_argument("--data-dir", default=str(repo_root() / "data"),
                         help="Root data directory (default: ./data under repo)")
+    parser.add_argument("--allow-file-dates", action="store_true",
+                        help="Allow ModifyDate/FileModifyDate as capture time fallback")
+
     args = parser.parse_args()
+
+    # Build date keys dynamically from the flag
+    base_keys = [
+        "DateTimeOriginal", "CreateDate", "MediaCreateDate", "TrackCreateDate",
+        "QuickTime:CreateDate", "QuickTime:CreationDate"
+    ]
+    if args.allow_file_dates:
+        base_keys += ["ModifyDate", "FileModifyDate"]
+
+    # Update the global used by extract_taken_at_exif_only()
+    global _DATE_KEYS
+    _DATE_KEYS = base_keys
+    # --- end of flag handling ---
 
     # Paths / bootstrap
     base = Path(args.data_dir).resolve()
@@ -565,13 +599,12 @@ def main():
     t0 = time.perf_counter()
 
     conn = open_db()
-    # Backward-compatible: ensure extra columns exist
     ensure_column(conn, "sightings", "folder_hint", "TEXT")
     ensure_column(conn, "sightings", "ingest_id", "TEXT")
 
-    wanted = set(args.sources)  # labels like 'pc', 'other', etc.
+    wanted = set(args.sources)
     for label, path in STAGING_SOURCES.items():
-        short = label.split("/", 1)[-1]  # 'pc' from 'Staging/pc'
+        short = label.split("/", 1)[-1]
         if wanted and short not in wanted and label not in wanted:
             continue
         ingest_one_source(conn, label, path, note=args.note)
@@ -581,7 +614,6 @@ def main():
     elapsed = time.perf_counter() - t0
     log(f"\n=== Ingest complete. Total time: {elapsed:.1f} seconds ===")
 
-    # quick peek at review queue
     conn2 = open_db()
     try:
         rows = conn2.execute("SELECT id, canonical_path, taken_at FROM v_review_queue LIMIT 10").fetchall()
