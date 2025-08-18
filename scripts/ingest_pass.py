@@ -12,7 +12,7 @@ Highlights:
 - DB auto-initializes from db/schema.sql the first time
 
 Requirements:
-- Python 3.10+
+- Python 3.9+ (uses tomli on ≤3.10)
 - exiftool on PATH
 """
 
@@ -25,14 +25,15 @@ import hashlib
 import subprocess
 import time
 import argparse
-import tomli as toml
+import tomli as toml   # you installed this; 3.11+ would use tomllib
 import shutil
 import re
+import logging
+import logging.handlers
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 from collections import defaultdict, Counter
-
 
 # ---------- Global toggles ----------
 DRY_RUN = True  # overridden by --write
@@ -65,7 +66,6 @@ QUAR: Dict[str, bool] = {}
 # exiftool (checked at runtime)
 EXIFTOOL_PATH = shutil.which("exiftool")
 
-
 # ---------- Utilities ----------
 
 def ensure_exiftool() -> None:
@@ -77,8 +77,14 @@ def repo_root() -> Path:
     """Resolve repo root as folder containing this file's parent (Pixarr/)."""
     return Path(__file__).resolve().parents[1]
 
-def log(msg: str) -> None:
-    print(msg, flush=sys.stdout.isatty())
+LOGGER = logging.getLogger("pixarr")
+
+def batch_logger(ingest_id: str, source: str) -> logging.LoggerAdapter:
+    """Attach ingest_id + source to every log record in this batch."""
+    return logging.LoggerAdapter(LOGGER, {"ingest_id": ingest_id, "source": source})
+
+def log(msg: str, level: int = logging.INFO) -> None:
+    LOGGER.log(level, msg)
 
 def ensure_dirs() -> None:
     """Create core dirs; quarantine reason subfolders are created lazily."""
@@ -184,7 +190,6 @@ def load_config(path: Path) -> dict:
     except Exception:
         return {}
 
-
 def build_quarantine_cfg(cfg_quar: dict) -> Dict[str, bool]:
     """Create the effective quarantine policy from TOML (defaults are safe)."""
     return {
@@ -196,7 +201,6 @@ def build_quarantine_cfg(cfg_quar: dict) -> Dict[str, bool]:
         "dupes":             bool(cfg_quar.get("dupes",             True)),
         "missing_datetime":  bool(cfg_quar.get("missing_datetime",  True)),
     }
-
 
 # ---------- File helpers ----------
 
@@ -367,6 +371,86 @@ def maybe_quarantine(src: Path, reason: str, ingest_id: str, extra: Optional[str
     else:
         log(f"QUARANTINE FAILED for {src} ({reason})")
 
+def setup_logging(data_dir: Path, logs_dir_arg: Optional[str], verbose: int,
+                  quiet: bool, log_level_arg: Optional[str], json_logs: bool) -> logging.Logger:
+    """
+    Configure console + file logging.
+    - Console level: derived from -v/-q or --log-level.
+    - File level: INFO (captures summary + actions); DEBUG if verbose>=2.
+    - File path: <data_dir>/logs/pixarr-YYYYmmdd_HHMMSS.log (or --logs-dir).
+    """
+
+    class EnsureContext(logging.Filter):
+        """Guarantee record has .source and .ingest_id so formatters don't explode."""
+        def filter(self, record: logging.LogRecord) -> bool:
+            if not hasattr(record, "source"):
+                record.source = "-"
+            if not hasattr(record, "ingest_id"):
+                record.ingest_id = "-"
+            return True
+
+    logger = logging.getLogger("pixarr")
+    logger.setLevel(logging.DEBUG)  # let handlers filter
+
+    # prevent duplicate handlers if re-run in same interpreter
+    if logger.handlers:
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
+
+    # Console level
+    if log_level_arg:
+        console_level = getattr(logging, log_level_arg.upper())
+    else:
+        if quiet:
+            console_level = logging.WARNING
+        elif verbose >= 2:
+            console_level = logging.DEBUG
+        else:
+            console_level = logging.INFO
+
+    # Console handler (human format)
+    ch = logging.StreamHandler()
+    ch.setLevel(console_level)
+    ch.addFilter(EnsureContext())
+    ch.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(ch)
+
+    # File handler
+    logs_dir = Path(logs_dir_arg) if logs_dir_arg else (data_dir / "logs")
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    log_path = logs_dir / f"pixarr-{ts}.log"
+
+    fh = logging.handlers.TimedRotatingFileHandler(
+        log_path, when="midnight", backupCount=14, encoding="utf-8"
+    )
+    fh.setLevel(logging.DEBUG if verbose >= 2 else logging.INFO)
+    fh.addFilter(EnsureContext())
+
+    if json_logs:
+        class JsonFormatter(logging.Formatter):
+            def format(self, record: logging.LogRecord) -> str:
+                payload = {
+                    "ts": datetime.utcfromtimestamp(record.created).isoformat() + "Z",
+                    "level": record.levelname,
+                    "msg": record.getMessage(),
+                    "name": record.name,
+                    "source": getattr(record, "source", None),
+                    "ingest_id": getattr(record, "ingest_id", None),
+                }
+                if record.exc_info:
+                    payload["exc"] = self.formatException(record.exc_info)
+                return json.dumps(payload, ensure_ascii=False)
+        fh.setFormatter(JsonFormatter())
+    else:
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)sZ [%(levelname)s] [%(source)s:%(ingest_id)s] %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S"
+        ))
+    logger.addHandler(fh)
+
+    logger.debug(f"Log file: {log_path}")
+    return logger
 
 # ---------- DB ops ----------
 
@@ -454,7 +538,6 @@ def already_finalized(conn: sqlite3.Connection, hash_hex: str) -> bool:
     )
     return cur.fetchone() is not None
 
-
 # ---------- Date from filename + resolver ----------
 
 def _taken_from_filename(name: str) -> Optional[datetime]:
@@ -519,10 +602,9 @@ def resolve_taken_at(meta: dict, filename: str, allow_filename_dates: bool) -> O
             return dt.isoformat()
     return None
 
-
 # ---------- Ingest core ----------
 
-def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root: Path, note: Optional[str] = None):
+def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500):
     """Run a full ingest pass for one staging root and return stats for end-of-run summary."""
     stats = {
         "label": source_label,
@@ -542,8 +624,10 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
 
     ingest_id = begin_ingest(conn, source_label, note)
     stats["ingest_id"] = ingest_id
+    ctx = batch_logger(ingest_id, source_label)
+
     log(f"\n=== {source_label} ===")
-    log(f"Started ingest batch: {ingest_id} ({staging_root})")
+    ctx.info("Started ingest batch: %s (%s)", ingest_id, staging_root)
 
     try:
         for root, dirs, files in os.walk(staging_root):
@@ -570,6 +654,12 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                     continue
 
                 stats["scanned"] += 1
+
+                # heartbeat (env overrides arg)
+                hb = int(os.environ.get("PIXARR_HEARTBEAT", heartbeat))
+                if hb > 0 and stats["scanned"] % hb == 0:
+                    ctx.info("… scanned=%d moved=%d quarantined=%d dupes=%d",
+                             stats["scanned"], stats["moved"], stats["quarantined"], stats["skipped_dupe"])
 
                 # per-file logic
                 try:
@@ -602,7 +692,7 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                         maybe_quarantine(p, "missing_datetime", ingest_id, extra=reason)
                         stats["quarantined"] += 1
                     else:
-                        log(f"SKIP missing_datetime: {p} ({reason})")
+                        ctx.debug("SKIP missing_datetime: %s (%s)", p, reason)
                     continue
                 # -----------------------------------------
 
@@ -629,7 +719,7 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                 # already in library
                 if already_finalized(conn, h):
                     stats["skipped_dupe"] += 1
-                    log(f"= DUP in library: {p} ({h[:8]})")
+                    ctx.debug("= DUP in library: %s (%s)", p, h[:8])
                     if QUAR.get("dupes", True):
                         stats["q_counts"]["duplicate_in_library"] += 1
                         maybe_quarantine(p, "duplicate_in_library", ingest_id)
@@ -649,13 +739,13 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                             "UPDATE media SET last_verified_at=?, updated_at=? WHERE id=?",
                             (now, now, mid),
                         )
-                        log(f"= Already tracked: state={current_state} path={current_canon}")
+                        ctx.debug("= Already tracked: state=%s path=%s", current_state, current_canon)
                         continue
 
                     if current_state == "review":
-                        log(f"! Missing on disk (review); will requeue -> {current_canon}")
+                        ctx.debug("! Missing on disk (review); will requeue -> %s", current_canon)
                     else:
-                        log(f"! Missing on disk (library); leaving for reconcile -> {current_canon}")
+                        ctx.debug("! Missing on disk (library); leaving for reconcile -> %s", current_canon)
                         stats["skipped_dupe"] += 1
                         continue
 
@@ -663,7 +753,7 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                 dest = plan_nonclobber(REVIEW_ROOT, fname)
 
                 if DRY_RUN:
-                    log(f"[DRY] MOVE {p} -> {dest}")
+                    ctx.debug("[DRY] MOVE %s -> %s", p, dest)
                     stats["moved"] += 1
                 else:
                     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -692,6 +782,7 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                             "UPDATE media SET state='review', canonical_path=?, updated_at=?, last_verified_at=? WHERE id=?",
                             (str(dest), now, now, mid),
                         )
+                        ctx.debug("MOVED %s -> %s", p, dest)
                         stats["moved"] += 1
 
                 conn.commit()
@@ -729,8 +820,31 @@ def main():
     parser.add_argument("--allow-filename-dates", action="store_true",
                         default=bool(cfg_ingest.get("allow_filename_dates", False)),
                         help="Allow filename-derived timestamps as fallback (e.g., PHOTO-YYYY-MM-DD-HH-MM-SS.jpg)")
+    parser.add_argument("--logs-dir", default=None,
+                        help="Where to write log files (default: <data_dir>/logs)")
+    parser.add_argument("--log-level", default=None, choices=["DEBUG","INFO","WARNING","ERROR","CRITICAL"],
+                        help="Force console log level (overrides -v/-q)")
+    parser.add_argument("-v", "--verbose", action="count", default=0,
+                        help="Increase console verbosity (repeatable)")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Minimal console output")
+    parser.add_argument("--json-logs", action="store_true",
+                        help="Write JSON-formatted logs to file handler")
+    parser.add_argument("--heartbeat", type=int, default=500,
+                        help="Emit a progress line every N scanned files (default 500)")
 
     args = parser.parse_args()
+
+    # setup logging
+    global LOGGER
+    LOGGER = setup_logging(
+        data_dir=Path(args.data_dir).resolve(),
+        logs_dir_arg=args.logs_dir,
+        verbose=args.verbose,
+        quiet=args.quiet,
+        log_level_arg=args.log_level,
+        json_logs=args.json_logs,
+    )
 
     # Build date keys dynamically from the flags
     base_keys = [
@@ -782,9 +896,8 @@ def main():
 
     # pick sources/paths (works with 'pc', 'other/trip1', absolute paths, etc.)
     try:
-        selected = resolve_source_tokens(args.sources)  # if you added this helper earlier
+        selected = resolve_source_tokens(args.sources)
     except NameError:
-        # fallback to the old behavior if you didn't add resolve_source_tokens yet
         wanted = set(args.sources)
         selected = []
         for label, path in STAGING_SOURCES.items():
@@ -795,7 +908,7 @@ def main():
 
     all_stats = []
     for label, path in selected:
-        stats = ingest_one_source(conn, label, path, note=args.note)
+        stats = ingest_one_source(conn, label, path, note=args.note, heartbeat=args.heartbeat)
         all_stats.append(stats)
 
     conn.close()
@@ -875,20 +988,6 @@ def main():
         conn2.close()
 
     log(f"\n=== Ingest complete. Total time: {elapsed:.1f} seconds ===")
-
-    # # quick peek at review queue
-    # conn2 = open_db()
-    # try:
-    #     rows = conn2.execute("SELECT id, canonical_path, taken_at FROM v_review_queue LIMIT 10").fetchall()
-    #     if rows:
-    #         log("\nSample Review queue:")
-    #         for rid, path, t in rows:
-    #             log(f"  id={rid[:8]}… taken_at={t} path={path}")
-    # except sqlite3.Error as e:
-    #     log(f"(note) could not read v_review_queue: {e}")
-    # finally:
-    #     conn2.close()
-
 
 if __name__ == "__main__":
     main()
