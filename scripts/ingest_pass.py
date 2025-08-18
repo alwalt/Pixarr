@@ -25,6 +25,7 @@ import hashlib
 import subprocess
 import time
 import argparse
+import tomli as toml
 import shutil
 import re
 from datetime import datetime
@@ -175,20 +176,14 @@ def resolve_source_tokens(tokens: list[str]) -> list[tuple[str, Path]]:
     return out
 
 def load_config(path: Path) -> dict:
-    """Load pixarr.toml if present; return dict of settings."""
-    cfg = {}
+    """Load pixarr.toml if present; return {} on any issue."""
+    if not path.exists():
+        return {}
     try:
-        import tomllib  # Python 3.11+
-        if path.exists():
-            cfg = tomllib.loads(path.read_text(encoding="utf-8"))
-    except ModuleNotFoundError:
-        try:
-            import tomli  # Python 3.10 backport
-            if path.exists():
-                cfg = tomli.loads(path.read_text(encoding="utf-8"))
-        except ModuleNotFoundError:
-            pass
-    return cfg
+        return toml.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
 
 def build_quarantine_cfg(cfg_quar: dict) -> Dict[str, bool]:
     """Create the effective quarantine policy from TOML (defaults are safe)."""

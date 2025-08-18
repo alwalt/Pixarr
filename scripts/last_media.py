@@ -21,23 +21,20 @@ import argparse
 import sqlite3
 from pathlib import Path
 from typing import Optional
-
+import tomli as toml  
 # ---------- tiny helpers (no exiftool imports) ----------
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 def load_config(path: Path) -> dict:
-    # Try stdlib (3.11+) first, then tomli backport.
+    """Load pixarr.toml if present; return {} on any issue."""
+    if not path.exists():
+        return {}
     try:
-        import tomllib  # py3.11+
-        return tomllib.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        return toml.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        try:
-            import tomli  # py3.10/3.9 backport
-            return tomli.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        except Exception:
-            return {}
+        return {}
 
 def resolve_db_path(cli_db: Optional[str], cli_data_dir: Optional[str]) -> Path:
     if cli_db:
