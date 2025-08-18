@@ -44,6 +44,7 @@ JUNK_FILES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 JUNK_PREFIXES = {"._"}  # AppleDouble resource forks like ._IMG_1234.JPG
 DIR_IGNORE = {".Spotlight-V100", ".fseventsd", ".Trashes", ".TemporaryItems"}
 
+
 # Quarantine toggles
 QUARANTINE_JUNK         = True
 QUARANTINE_UNSUPPORTED  = True
@@ -51,8 +52,10 @@ QUARANTINE_ZERO_BYTE    = True
 QUARANTINE_STAT_ERROR   = True
 QUARANTINE_MOVE_FAILURE = True
 QUARANTINE_DUPES        = True  # dupes of existing library content
-# NEW: quarantine when no EXIF/QuickTime capture date is present
-QUARANTINE_MISSING_DATETIME = True
+QUARANTINE_MISSING_DATETIME = True # NEW: quarantine when no EXIF/QuickTime capture date is present
+
+# Fallback toggles (set via CLI flags in main())
+ALLOW_FILENAME_DATES = False   # default; set from --allow-filename-dates
 
 # ---------- Paths configured at runtime ----------
 DATA_DIR: Path
@@ -391,6 +394,52 @@ def already_finalized(conn: sqlite3.Connection, hash_hex: str) -> bool:
     )
     return cur.fetchone() is not None
 
+def _taken_from_filename(name: str) -> Optional[datetime]:
+    """
+    Parse common filename timestamp patterns and return a datetime, or None.
+    Examples handled:
+      - PHOTO-2024-07-10-20-08-42.jpg
+      - IMG_20240710_200842.HEIC
+      - 2024-07-10 20.08.42.jpg
+      - WhatsApp Image 2024-07-10 at 20.08.42.jpeg
+      - PXL_20240710_200842123.jpg  (uses first HHMMSS after date)
+    """
+    s = name
+
+    # PHOTO-YYYY-MM-DD-HH-MM-SS (allow separators -, _, space and :, . between time parts)
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})[-_ T]+(\d{2})[-_.:](\d{2})[-_.:](\d{2})", s)
+    if m:
+        y, mo, d, H, M, S = map(int, m.groups())
+        return datetime(y, mo, d, H, M, S)
+
+    # YYYYMMDD[_-]HHMMSS  (e.g., IMG_20240710_200842)
+    m = re.search(r"(\d{4})(\d{2})(\d{2})[_-](\d{2})(\d{2})(\d{2})", s)
+    if m:
+        y, mo, d, H, M, S = map(int, m.groups())
+        return datetime(y, mo, d, H, M, S)
+
+    # WhatsApp-style: YYYY-MM-DD at HH.MM.SS
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})\s+at\s+(\d{2})[.:](\d{2})[.:](\d{2})", s, re.IGNORECASE)
+    if m:
+        y, mo, d, H, M, S = map(int, m.groups())
+        return datetime(y, mo, d, H, M, S)
+
+    # Loose: YYYY-MM-DD[ _]HH.MM.SS
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})[ _](\d{2})[.:](\d{2})[.:](\d{2})", s)
+    if m:
+        y, mo, d, H, M, S = map(int, m.groups())
+        return datetime(y, mo, d, H, M, S)
+
+    # Google PXL_: PXL_YYYYMMDD_HHMMSS...
+    m = re.search(r"PXL_(\d{4})(\d{2})(\d{2})[_-](\d{2})(\d{2})(\d{2})", s, re.IGNORECASE)
+    if m:
+        y, mo, d, H, M, S = map(int, m.groups())
+        return datetime(y, mo, d, H, M, S)
+
+    return None
+
+
+
 # ---------- Ingest core ----------
 
 def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root: Path, note: Optional[str] = None):
@@ -449,16 +498,27 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
                 ext = p.suffix.lower()
                 hint = last_meaningful_folder(p.parent)
 
-                # EXIF-only capture time
+                # -------- capture time resolution --------
+                # 1) EXIF/QuickTime tags (strict by default)
                 taken_at = extract_taken_at_exif_only(meta)
+
+                # 2) Optional filename-derived fallback (only if flag enabled)
+                if not taken_at and ALLOW_FILENAME_DATES:
+                    fn_dt = _taken_from_filename(name)  # make sure you added this helper
+                    if fn_dt:
+                        taken_at = fn_dt.isoformat()
+
+                # 3) Still nothing? quarantine
                 if not taken_at:
                     if QUARANTINE_MISSING_DATETIME:
-                        maybe_quarantine(p, "missing_datetime", ingest_id, extra="no EXIF/QuickTime capture date")
+                        extra_msg = "no capture date (exif/qt"
+                        if ALLOW_FILENAME_DATES:
+                            extra_msg += "/filename"
+                        extra_msg += ")"
+                        maybe_quarantine(p, "missing_datetime", ingest_id, extra=extra_msg)
                         quarantined += 1
                         continue
-                    else:
-                        # (Disabled in this build) could fall back here if desired
-                        pass
+                # -----------------------------------------
 
                 media_row = {
                     "id": uuid_from_hash(h),
@@ -551,6 +611,7 @@ def ingest_one_source(conn: sqlite3.Connection, source_label: str, staging_root:
     finally:
         finish_ingest(conn, ingest_id)
 
+
 # ---------- Main ----------
 
 def main():
@@ -562,21 +623,26 @@ def main():
                         help="Root data directory (default: ./data under repo)")
     parser.add_argument("--allow-file-dates", action="store_true",
                         help="Allow ModifyDate/FileModifyDate as capture time fallback")
+    parser.add_argument("--allow-filename-dates", action="store_true",
+                        help="Allow filename-derived timestamps as fallback (e.g., PHOTO-YYYY-MM-DD-HH-MM-SS.jpg)")
 
     args = parser.parse_args()
 
-    # Build date keys dynamically from the flag
+    # Build date keys dynamically from the flags
     base_keys = [
         "DateTimeOriginal", "CreateDate", "MediaCreateDate", "TrackCreateDate",
         "QuickTime:CreateDate", "QuickTime:CreationDate"
     ]
-    if args.allow_file_dates:
+    if args.allow_file_dates:  # <-- underscores, not hyphen
         base_keys += ["ModifyDate", "FileModifyDate"]
 
     # Update the global used by extract_taken_at_exif_only()
     global _DATE_KEYS
     _DATE_KEYS = base_keys
-    # --- end of flag handling ---
+
+    # Expose filename-dates flag to the ingest loop
+    global ALLOW_FILENAME_DATES
+    ALLOW_FILENAME_DATES = args.allow_filename_dates  # <-- underscores
 
     # Paths / bootstrap
     base = Path(args.data_dir).resolve()
