@@ -34,3 +34,6 @@ data/media/Quarantine/
 # Logs / temp
 *.log
 *.tmp
+
+# test fixtures
+data/media/Staging/other/_testcase_zoo/

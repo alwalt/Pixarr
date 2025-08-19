@@ -227,9 +227,9 @@ def exiftool_json(p: Path) -> dict:
     except Exception:
         return {}
 
-def is_supported_media(p: Path) -> bool:
-    """Return True if file has one of the supported media extensions."""
-    return p.is_file() and p.suffix.lower() in SUPPORTED_EXT
+def is_media_candidate(p: Path) -> bool:
+    # only look at extension here; let stat() decide file health
+    return p.suffix.lower() in SUPPORTED_EXT
 
 # Only capture/camera-origin dates. (File dates optionally added via flag)
 _DATE_KEYS = [
@@ -378,63 +378,94 @@ def quarantine_file(src: Path, reason: str, ingest_id: str, extra: Optional[str]
     _write_quarantine_sidecar(dest if moved else dest_dir / (src.name + ".failed"), payload)
     return dest if moved else None
 
-def maybe_quarantine(src: Path, reason: str, ingest_id: str, extra: Optional[str] = None) -> Optional[Path]:
+def maybe_quarantine(src: Path, reason: str, ingest_id: str, extra: Optional[str] = None, source: Optional[str] = None) -> Optional[Path]:
+    """
+    Quarantine with consistent logging.
+    - Dry-run and write: identical log levels (DRY just adds a prefix).
+    - Quarantines are WARNING; visibility on console depends on handler filters.
+    """
+    level = logging.WARNING
+    msg = f"QUARANTINE {src} -> {reason} ({extra or ''})"
+    _extra = {"ingest_id": ingest_id, "source": source or "-"}
+
     if DRY_RUN:
-        log(f"[DRY] QUARANTINE {src} -> {reason} ({extra or ''})")
+        LOGGER.log(level, f"[DRY] {msg}", extra=_extra)
         return None
+
     q = quarantine_file(src, reason, ingest_id, extra=extra)
     if q:
-        log(f"QUARANTINED {src} -> {q} ({reason})")
+        LOGGER.log(level, f"{msg} -> {q}", extra=_extra)
+        return q
     else:
-        log(f"QUARANTINE FAILED for {src} ({reason})")
-    return q
+        LOGGER.error(f"QUARANTINE FAILED for {src} ({reason})", extra=_extra)
+        return None
 
 
 def setup_logging(data_dir: Path, logs_dir_arg: Optional[str], verbose: int,
                   quiet: bool, log_level_arg: Optional[str], json_logs: bool) -> logging.Logger:
     """
-    Configure console + file logging.
-    - Console level: derived from -v/-q or --log-level.
-    - File level: INFO (captures summary + actions); DEBUG if verbose>=2.
-    - File path: <data_dir>/logs/pixarr-YYYYmmdd_HHMMSS.log (or --logs-dir).
+    Console/File matrix:
+      - -q:   console = silent;        file = INFO only (drop WARNING+)
+      - none: console = INFO only;     file = INFO+ (INFO & WARNING)
+      - -v:   console = INFO+;         file = INFO+ (INFO & WARNING)
+      - -vv:  console = DEBUG;         file = DEBUG
+      - --log-level=X: both console & file use X (no special filters)
     """
 
     class EnsureContext(logging.Filter):
-        """Guarantee record has .source and .ingest_id so formatters don't explode."""
         def filter(self, record: logging.LogRecord) -> bool:
-            if not hasattr(record, "source"):
-                record.source = "-"
-            if not hasattr(record, "ingest_id"):
-                record.ingest_id = "-"
+            if not hasattr(record, "source"):   record.source = "-"
+            if not hasattr(record, "ingest_id"): record.ingest_id = "-"
             return True
 
+    class MaxLevelFilter(logging.Filter):
+        """Allow records up to and including `levelno` (drop anything higher)."""
+        def __init__(self, levelno: int): super().__init__(); self.levelno = levelno
+        def filter(self, record: logging.LogRecord) -> bool: return record.levelno <= self.levelno
+
     logger = logging.getLogger("pixarr")
-    logger.setLevel(logging.DEBUG)  # let handlers filter
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    for h in list(logger.handlers): logger.removeHandler(h)
 
-    # prevent duplicate handlers if re-run in same interpreter
-    if logger.handlers:
-        for h in list(logger.handlers):
-            logger.removeHandler(h)
-
-    # Console level
+    # Decide levels & max-filters
     if log_level_arg:
         console_level = getattr(logging, log_level_arg.upper())
+        file_level    = console_level
+        console_max   = None
+        file_max      = None
     else:
         if quiet:
-            console_level = logging.WARNING
+            console_level = logging.CRITICAL   # prints nothing (we don't emit CRITICAL)
+            file_level    = logging.INFO       # keep audit trail at INFO
+            console_max   = None               # already silent
+            file_max      = MaxLevelFilter(logging.INFO)  # drop WARNING+
         elif verbose >= 2:
             console_level = logging.DEBUG
-        else:
+            file_level    = logging.DEBUG
+            console_max   = None
+            file_max      = None
+        elif verbose >= 1:
             console_level = logging.INFO
+            file_level    = logging.INFO
+            console_max   = None               # show INFO & WARNING on console
+            file_max      = None               # INFO & WARNING in file
+        else:
+            # default: console shows ONLY INFO (hide WARNING); file keeps INFO & WARNING
+            console_level = logging.INFO
+            file_level    = logging.INFO
+            console_max   = MaxLevelFilter(logging.INFO)
+            file_max      = None
 
     # Console handler (human format)
     ch = logging.StreamHandler()
     ch.setLevel(console_level)
     ch.addFilter(EnsureContext())
+    if console_max: ch.addFilter(console_max)
     ch.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(ch)
 
-    # File handler
+    # File handler (rotating)
     logs_dir = Path(logs_dir_arg) if logs_dir_arg else (data_dir / "logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -443,8 +474,9 @@ def setup_logging(data_dir: Path, logs_dir_arg: Optional[str], verbose: int,
     fh = logging.handlers.TimedRotatingFileHandler(
         log_path, when="midnight", backupCount=14, encoding="utf-8"
     )
-    fh.setLevel(logging.DEBUG if verbose >= 2 else logging.INFO)
+    fh.setLevel(file_level)
     fh.addFilter(EnsureContext())
+    if file_max: fh.addFilter(file_max)
 
     if json_logs:
         class JsonFormatter(logging.Formatter):
@@ -470,6 +502,7 @@ def setup_logging(data_dir: Path, logs_dir_arg: Optional[str], verbose: int,
 
     logger.debug(f"Log file: {log_path}")
     return logger
+
 
 # ---------- DB ops ----------
 
@@ -668,12 +701,12 @@ def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500
                     if name in JUNK_FILES or any(name.startswith(pref) for pref in JUNK_PREFIXES):
                         if QUAR.get("junk", True):
                             stats["q_counts"]["junk"] += 1
-                            maybe_quarantine(p, "junk", ingest_id, extra=("appledouble" if name.startswith("._") else "system_file"))
+                            maybe_quarantine(p, "junk", ingest_id, extra=("appledouble" if name.startswith("._") else "system_file"), source=source_label)
                             stats["quarantined"] += 1
                         continue
 
                     # unsupported extensions
-                    if not is_supported_media(p):
+                    if not is_media_candidate(p):
                         if QUAR.get("unsupported_ext", True):
                             stats["q_counts"]["unsupported_ext"] += 1
                             maybe_quarantine(p, "unsupported_ext", ingest_id, extra=p.suffix.lower())
@@ -694,14 +727,14 @@ def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500
                     except Exception as e:
                         if QUAR.get("stat_error", True):
                             stats["q_counts"]["stat_error"] += 1
-                            maybe_quarantine(p, "stat_error", ingest_id, extra=str(e))
+                            maybe_quarantine(p, "stat_error", ingest_id, extra=str(e), source=source_label)
                             stats["quarantined"] += 1
                         continue
 
                     if size == 0:
                         if QUAR.get("zero_bytes", True):
                             stats["q_counts"]["zero_bytes"] += 1
-                            maybe_quarantine(p, "zero_bytes", ingest_id)
+                            maybe_quarantine(p, "zero_bytes", ingest_id, source=source_label)
                             stats["quarantined"] += 1
                         continue
 
@@ -718,7 +751,7 @@ def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500
 
                         q_dest = None
                         if QUAR.get("missing_datetime", True):
-                            q_dest = maybe_quarantine(p, reason_code, ingest_id, extra=reason_msg)
+                            q_dest = maybe_quarantine(p, reason_code, ingest_id, extra=reason_msg, source=source_label)
 
                         # track in DB as quarantined (only for *media-like* files where we have a hash)
                         media_row = {
@@ -773,7 +806,7 @@ def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500
                         ctx.debug("= DUP in library: %s (%s)", p, h[:8])
                         if QUAR.get("dupes", True):
                             stats["q_counts"]["duplicate_in_library"] += 1
-                            maybe_quarantine(p, "duplicate_in_library", ingest_id)
+                            maybe_quarantine(p, "duplicate_in_library", ingest_id, source=source_label)
                             stats["quarantined"] += 1
                         continue
 
@@ -823,7 +856,7 @@ def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500
                             except Exception as e2:
                                 moved_ok = False
                                 if QUAR.get("move_failed", True):
-                                    q_path = maybe_quarantine(p, "move_failed", ingest_id, extra=f"{e1} | {e2}")
+                                    q_path = maybe_quarantine(p, "move_failed", ingest_id, extra=f"{e1} | {e2}", source=source_label)
                                     # Flip the row to quarantined since the move didn't succeed
                                     now = datetime.utcnow().isoformat()
                                     conn.execute(
