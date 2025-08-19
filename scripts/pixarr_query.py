@@ -8,7 +8,6 @@ Examples:
   # Quarantined files that were NOT moved (dry-run or move failed), newest first
   python scripts/pixarr_query.py --data-dir /Volumes/Data/Pixarr/data quarantine --unmoved-only
 
-
   # Same, filtered by reason and limited
   python scripts/pixarr_query.py quarantine --reason missing_datetime --unmoved-only --limit 50
 
@@ -20,6 +19,9 @@ Examples:
 
   # Quarantine reason counts
   python scripts/pixarr_query.py reasons
+
+  # State counts
+  python scripts/pixarr_query.py states
 """
 
 import argparse
@@ -169,6 +171,22 @@ def cmd_batches(args):
     print_rows(rows)
     conn.close()
 
+def cmd_states(args):
+    conn = connect(db_path_for(Path(args.data_dir)))
+    base = "FROM media"
+    where_sql = f" WHERE {args.where}" if args.where else ""
+    rows = conn.execute(
+        f"SELECT state, COUNT(*) AS n {base}{where_sql} "
+        "GROUP BY state ORDER BY n DESC"
+    ).fetchall()
+    total = conn.execute(f"SELECT COUNT(*) {base}{where_sql}").fetchone()[0]
+
+    print("State counts:")
+    for r in rows:
+        print(f"  {r['state']:12s} {r['n']}")
+    print(f"TOTAL: {total}")
+    conn.close()
+
 # --- main ---
 def main():
     parser = argparse.ArgumentParser(description="Pixarr DB inspection")
@@ -199,6 +217,11 @@ def main():
     p_b = sub.add_parser("batches", help="List recent ingest batches")
     p_b.add_argument("--limit", type=int, default=20)
     p_b.set_defaults(func=cmd_batches)
+
+    p_states = sub.add_parser("states", help="Count rows by media state")
+    p_states.add_argument("--where", default=None,
+                          help="Optional SQL WHERE on media, e.g. \"taken_at >= '2024-01-01'\"")
+    p_states.set_defaults(func=cmd_states)
 
     args = parser.parse_args()
     args.func(args)
