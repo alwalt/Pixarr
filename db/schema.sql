@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS media (
   added_at         TEXT NOT NULL,                 -- first-seen timestamp (UTC ISO8601)
   updated_at       TEXT NOT NULL,                 -- last update timestamp (UTC ISO8601)
   xmp_written      INTEGER DEFAULT 0,             -- 0/1 flag (written after library)
+  -- quarantine metadata
+  quarantine_reason TEXT,                         -- why quarantined (e.g. 'missing_datetime','unsupported_ext')
   -- deletion/verification (for reconcile scripts & audits)
   deleted_at       TEXT,                          -- when we marked it deleted
   last_verified_at TEXT,                          -- last time we saw the file on disk

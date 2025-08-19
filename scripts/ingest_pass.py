@@ -248,25 +248,43 @@ _dt_re = re.compile(
 )
 
 def _parse_exif_dt(s: str) -> Optional[datetime]:
-    s = s.strip()
+    if s is None:
+        return None
+    s = str(s).strip()
+
+    # Common invalid/sentinel values → treat as missing
+    if not s or s.startswith(("0000:00:00", "0001:01:01")):
+        return None
+    # Optional: some files default to Unix epoch—skip if you don’t trust it
+    if s.startswith("1970:01:01"):
+        return None
+
     m = _dt_re.match(s)
     if m:
-        dt = datetime.strptime(s[:19], "%Y:%m:%d %H:%M:%S")
+        base = s[:19]  # "YYYY:MM:DD HH:MM:SS"
+        try:
+            dt = datetime.strptime(base, "%Y:%m:%d %H:%M:%S")
+        except ValueError:
+            return None
+
         tz = m.group("tz")
         if tz and tz != "Z":
+            # normalize "+hhmm" → "+hh:mm"
             tz = tz if ":" in tz else (tz[:3] + ":" + tz[3:])
             try:
                 return datetime.fromisoformat(dt.strftime("%Y-%m-%dT%H:%M:%S") + tz)
             except Exception:
-                pass
+                return None
         elif tz == "Z":
             return datetime.fromisoformat(dt.strftime("%Y-%m-%dT%H:%M:%S") + "+00:00")
         return dt
-    # ISO fallback (some containers already ISO-like)
+
+    # ISO-like fallback some containers emit
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
         return None
+
 
 def extract_taken_at_exif_only(meta: dict) -> Optional[str]:
     """Return taken_at only from EXIF/QuickTime tags. Otherwise None."""
@@ -360,16 +378,17 @@ def quarantine_file(src: Path, reason: str, ingest_id: str, extra: Optional[str]
     _write_quarantine_sidecar(dest if moved else dest_dir / (src.name + ".failed"), payload)
     return dest if moved else None
 
-def maybe_quarantine(src: Path, reason: str, ingest_id: str, extra: Optional[str] = None) -> None:
-    """Quarantine only in write-mode; log in dry-run."""
+def maybe_quarantine(src: Path, reason: str, ingest_id: str, extra: Optional[str] = None) -> Optional[Path]:
     if DRY_RUN:
         log(f"[DRY] QUARANTINE {src} -> {reason} ({extra or ''})")
-        return
+        return None
     q = quarantine_file(src, reason, ingest_id, extra=extra)
     if q:
         log(f"QUARANTINED {src} -> {q} ({reason})")
     else:
         log(f"QUARANTINE FAILED for {src} ({reason})")
+    return q
+
 
 def setup_logging(data_dir: Path, logs_dir_arg: Optional[str], verbose: int,
                   quiet: bool, log_level_arg: Optional[str], json_logs: bool) -> logging.Logger:
@@ -477,18 +496,20 @@ def upsert_media(conn: sqlite3.Connection, row: dict) -> Tuple[str, str, Optiona
     Return (id, state, canonical_path).
     """
     now = datetime.utcnow().isoformat()
-    row.setdefault("added_at", now)   # only on insert
-    row["updated_at"] = now           # ALWAYS refresh
+    row.setdefault("added_at", now)
+    row["updated_at"] = now
 
     try:
         conn.execute(
             """
             INSERT INTO media (
-            id, hash_sha256, phash, ext, bytes, taken_at, tz_offset,
-            gps_lat, gps_lon, state, canonical_path, added_at, updated_at, xmp_written
+              id, hash_sha256, phash, ext, bytes, taken_at, tz_offset,
+              gps_lat, gps_lon, state, canonical_path,
+              added_at, updated_at, xmp_written, quarantine_reason
             ) VALUES (
-            :id, :hash_sha256, :phash, :ext, :bytes, :taken_at, :tz_offset,
-            :gps_lat, :gps_lon, :state, :canonical_path, :added_at, :updated_at, :xmp_written
+              :id, :hash_sha256, :phash, :ext, :bytes, :taken_at, :tz_offset,
+              :gps_lat, :gps_lon, :state, :canonical_path,
+              :added_at, :updated_at, :xmp_written, :quarantine_reason
             )
             """,
             row,
@@ -497,15 +518,20 @@ def upsert_media(conn: sqlite3.Connection, row: dict) -> Tuple[str, str, Optiona
         conn.execute(
             """
             UPDATE media
-            SET taken_at = COALESCE(media.taken_at, :taken_at),
-                gps_lat  = COALESCE(media.gps_lat,  :gps_lat),
-                gps_lon  = COALESCE(media.gps_lon,  :gps_lon),
-                state    = CASE
-                               WHEN media.state IN ('library','quarantine','deleted') THEN media.state
-                               ELSE :state
-                           END,
+            SET taken_at       = COALESCE(media.taken_at, :taken_at),
+                gps_lat        = COALESCE(media.gps_lat,  :gps_lat),
+                gps_lon        = COALESCE(media.gps_lon,  :gps_lon),
+                state          = CASE
+                                    WHEN media.state IN ('library','quarantine','deleted')
+                                         THEN media.state
+                                    ELSE :state
+                                 END,
                 canonical_path = COALESCE(:canonical_path, media.canonical_path),
-                updated_at = :updated_at
+                quarantine_reason = CASE
+                                      WHEN :state='quarantine' THEN :quarantine_reason
+                                      ELSE NULL
+                                    END,
+                updated_at     = :updated_at
             WHERE hash_sha256 = :hash_sha256
             """,
             {**row, "updated_at": now},
@@ -517,6 +543,7 @@ def upsert_media(conn: sqlite3.Connection, row: dict) -> Tuple[str, str, Optiona
     )
     mid, st, cpath = cur.fetchone()
     return mid, st, cpath
+
 
 def insert_sighting(conn: sqlite3.Connection, media_id: str, full_path: Path,
                     filename: str, source_root: str, folder_hint: Optional[str],
@@ -636,156 +663,198 @@ def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500
 
             for name in files:
                 p = Path(root) / name
-
-                # junk files and AppleDouble resource forks
-                if name in JUNK_FILES or any(name.startswith(pref) for pref in JUNK_PREFIXES):
-                    if QUAR.get("junk", True):
-                        stats["q_counts"]["junk"] += 1
-                        maybe_quarantine(p, "junk", ingest_id, extra=("appledouble" if name.startswith("._") else "system_file"))
-                        stats["quarantined"] += 1
-                    continue
-
-                # unsupported extensions
-                if not is_supported_media(p):
-                    if QUAR.get("unsupported_ext", True):
-                        stats["q_counts"]["unsupported_ext"] += 1
-                        maybe_quarantine(p, "unsupported_ext", ingest_id, extra=p.suffix.lower())
-                        stats["quarantined"] += 1
-                    continue
-
-                stats["scanned"] += 1
-
-                # heartbeat (env overrides arg)
-                hb = int(os.environ.get("PIXARR_HEARTBEAT", heartbeat))
-                if hb > 0 and stats["scanned"] % hb == 0:
-                    ctx.info("… scanned=%d moved=%d quarantined=%d dupes=%d",
-                             stats["scanned"], stats["moved"], stats["quarantined"], stats["skipped_dupe"])
-
-                # per-file logic
                 try:
-                    size = p.stat().st_size
-                except Exception as e:
-                    if QUAR.get("stat_error", True):
-                        stats["q_counts"]["stat_error"] += 1
-                        maybe_quarantine(p, "stat_error", ingest_id, extra=str(e))
-                        stats["quarantined"] += 1
-                    continue
-
-                if size == 0:
-                    if QUAR.get("zero_bytes", True):
-                        stats["q_counts"]["zero_bytes"] += 1
-                        maybe_quarantine(p, "zero_bytes", ingest_id)
-                        stats["quarantined"] += 1
-                    continue
-
-                h = sha256_file(p)
-                meta = exiftool_json(p)
-                ext = p.suffix.lower()
-                hint = last_meaningful_folder(p.parent)
-
-                # -------- capture time resolution --------
-                taken_at = resolve_taken_at(meta, name, ALLOW_FILENAME_DATES)
-                if not taken_at:
-                    reason = "no capture date (exif/qt" + ("/filename" if ALLOW_FILENAME_DATES else "") + ")"
-                    if QUAR.get("missing_datetime", True):
-                        stats["q_counts"]["missing_datetime"] += 1
-                        maybe_quarantine(p, "missing_datetime", ingest_id, extra=reason)
-                        stats["quarantined"] += 1
-                    else:
-                        ctx.debug("SKIP missing_datetime: %s (%s)", p, reason)
-                    continue
-                # -----------------------------------------
-
-                media_row = {
-                    "id": uuid_from_hash(h),
-                    "hash_sha256": h,
-                    "phash": None,
-                    "ext": ext,
-                    "bytes": size,
-                    "taken_at": taken_at,
-                    "tz_offset": None,
-                    "gps_lat": meta.get("GPSLatitude") if meta.get("GPSLatitude") is not None else None,
-                    "gps_lon": meta.get("GPSLongitude") if meta.get("GPSLongitude") is not None else None,
-                    "state": "review",
-                    "canonical_path": None,
-                    "added_at": datetime.utcnow().isoformat(),
-                    "updated_at": datetime.utcnow().isoformat(),
-                    "xmp_written": 0,
-                }
-
-                mid, current_state, current_canon = upsert_media(conn, media_row)
-                insert_sighting(conn, mid, p, name, source_label, hint, ingest_id)
-
-                # already in library
-                if already_finalized(conn, h):
-                    stats["skipped_dupe"] += 1
-                    ctx.debug("= DUP in library: %s (%s)", p, h[:8])
-                    if QUAR.get("dupes", True):
-                        stats["q_counts"]["duplicate_in_library"] += 1
-                        maybe_quarantine(p, "duplicate_in_library", ingest_id)
-                        stats["quarantined"] += 1
-                    continue
-
-                if current_state in ("review", "library") and current_canon:
-                    try:
-                        canon_missing = not Path(current_canon).exists()
-                    except Exception:
-                        canon_missing = True
-
-                    if not canon_missing:
-                        stats["updated"] += 1
-                        now = datetime.utcnow().isoformat()
-                        conn.execute(
-                            "UPDATE media SET last_verified_at=?, updated_at=? WHERE id=?",
-                            (now, now, mid),
-                        )
-                        ctx.debug("= Already tracked: state=%s path=%s", current_state, current_canon)
+                    # junk files and AppleDouble resource forks
+                    if name in JUNK_FILES or any(name.startswith(pref) for pref in JUNK_PREFIXES):
+                        if QUAR.get("junk", True):
+                            stats["q_counts"]["junk"] += 1
+                            maybe_quarantine(p, "junk", ingest_id, extra=("appledouble" if name.startswith("._") else "system_file"))
+                            stats["quarantined"] += 1
                         continue
 
-                    if current_state == "review":
-                        ctx.debug("! Missing on disk (review); will requeue -> %s", current_canon)
-                    else:
-                        ctx.debug("! Missing on disk (library); leaving for reconcile -> %s", current_canon)
+                    # unsupported extensions
+                    if not is_supported_media(p):
+                        if QUAR.get("unsupported_ext", True):
+                            stats["q_counts"]["unsupported_ext"] += 1
+                            maybe_quarantine(p, "unsupported_ext", ingest_id, extra=p.suffix.lower())
+                            stats["quarantined"] += 1
+                        continue
+
+                    stats["scanned"] += 1
+
+                    # heartbeat (env overrides arg)
+                    hb = int(os.environ.get("PIXARR_HEARTBEAT", heartbeat))
+                    if hb > 0 and stats["scanned"] % hb == 0:
+                        ctx.info("… scanned=%d moved=%d quarantined=%d dupes=%d",
+                                 stats["scanned"], stats["moved"], stats["quarantined"], stats["skipped_dupe"])
+
+                    # per-file logic
+                    try:
+                        size = p.stat().st_size
+                    except Exception as e:
+                        if QUAR.get("stat_error", True):
+                            stats["q_counts"]["stat_error"] += 1
+                            maybe_quarantine(p, "stat_error", ingest_id, extra=str(e))
+                            stats["quarantined"] += 1
+                        continue
+
+                    if size == 0:
+                        if QUAR.get("zero_bytes", True):
+                            stats["q_counts"]["zero_bytes"] += 1
+                            maybe_quarantine(p, "zero_bytes", ingest_id)
+                            stats["quarantined"] += 1
+                        continue
+
+                    h = sha256_file(p)
+                    meta = exiftool_json(p)
+                    ext = p.suffix.lower()
+                    hint = last_meaningful_folder(p.parent)
+
+                    # -------- capture time resolution --------
+                    taken_at = resolve_taken_at(meta, name, ALLOW_FILENAME_DATES)
+                    if not taken_at:
+                        reason_code = "missing_datetime"
+                        reason_msg  = "no capture date (exif/qt" + ("/filename" if ALLOW_FILENAME_DATES else "") + ")"
+
+                        q_dest = None
+                        if QUAR.get("missing_datetime", True):
+                            q_dest = maybe_quarantine(p, reason_code, ingest_id, extra=reason_msg)
+
+                        # track in DB as quarantined (only for *media-like* files where we have a hash)
+                        media_row = {
+                            "id": uuid_from_hash(h),
+                            "hash_sha256": h,
+                            "phash": None,
+                            "ext": ext,
+                            "bytes": size,
+                            "taken_at": None,
+                            "tz_offset": None,
+                            "gps_lat": meta.get("GPSLatitude") if meta.get("GPSLatitude") is not None else None,
+                            "gps_lon": meta.get("GPSLongitude") if meta.get("GPSLongitude") is not None else None,
+                            "state": "quarantine",
+                            "canonical_path": str(q_dest) if q_dest and not DRY_RUN else None,
+                            "added_at": datetime.utcnow().isoformat(),
+                            "updated_at": datetime.utcnow().isoformat(),
+                            "xmp_written": 0,
+                            "quarantine_reason": reason_code,
+                        }
+                        mid, _, _ = upsert_media(conn, media_row)
+                        insert_sighting(conn, mid, p, name, source_label, hint, ingest_id)
+                        stats["q_counts"][reason_code] += 1
+                        stats["quarantined"] += 1
+                        conn.commit()
+                        continue
+                    # -----------------------------------------
+
+                    media_row = {
+                        "id": uuid_from_hash(h),
+                        "hash_sha256": h,
+                        "phash": None,
+                        "ext": ext,
+                        "bytes": size,
+                        "taken_at": taken_at,
+                        "tz_offset": None,
+                        "gps_lat": meta.get("GPSLatitude") if meta.get("GPSLatitude") is not None else None,
+                        "gps_lon": meta.get("GPSLongitude") if meta.get("GPSLongitude") is not None else None,
+                        "state": "review",
+                        "canonical_path": None,
+                        "added_at": datetime.utcnow().isoformat(),
+                        "updated_at": datetime.utcnow().isoformat(),
+                        "xmp_written": 0,
+                        "quarantine_reason": None,  # ensure UPDATE clears any previous reason
+                    }
+
+                    mid, current_state, current_canon = upsert_media(conn, media_row)
+                    insert_sighting(conn, mid, p, name, source_label, hint, ingest_id)
+
+                    # already in library
+                    if already_finalized(conn, h):
                         stats["skipped_dupe"] += 1
+                        ctx.debug("= DUP in library: %s (%s)", p, h[:8])
+                        if QUAR.get("dupes", True):
+                            stats["q_counts"]["duplicate_in_library"] += 1
+                            maybe_quarantine(p, "duplicate_in_library", ingest_id)
+                            stats["quarantined"] += 1
                         continue
 
-                fname = canonical_name(taken_at, h, ext)
-                dest = plan_nonclobber(REVIEW_ROOT, fname)
-
-                if DRY_RUN:
-                    ctx.debug("[DRY] MOVE %s -> %s", p, dest)
-                    stats["moved"] += 1
-                else:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    moved_ok = False
-                    try:
-                        p.rename(dest)
-                        moved_ok = True
-                    except Exception as e1:
+                    if current_state in ("review", "library") and current_canon:
                         try:
-                            shutil.copy2(p, dest)
-                            moved_ok = True
-                            try:
-                                p.unlink()
-                            except Exception:
-                                pass
-                        except Exception as e2:
-                            moved_ok = False
-                            if QUAR.get("move_failed", True):
-                                stats["q_counts"]["move_failed"] += 1
-                                maybe_quarantine(p, "move_failed", ingest_id, extra=f"{e1} | {e2}")
-                                stats["quarantined"] += 1
+                            canon_missing = not Path(current_canon).exists()
+                        except Exception:
+                            canon_missing = True
 
-                    if moved_ok:
-                        now = datetime.utcnow().isoformat()
-                        conn.execute(
-                            "UPDATE media SET state='review', canonical_path=?, updated_at=?, last_verified_at=? WHERE id=?",
-                            (str(dest), now, now, mid),
-                        )
-                        ctx.debug("MOVED %s -> %s", p, dest)
+                        if not canon_missing:
+                            stats["updated"] += 1
+                            now = datetime.utcnow().isoformat()
+                            conn.execute(
+                                "UPDATE media SET last_verified_at=?, updated_at=? WHERE id=?",
+                                (now, now, mid),
+                            )
+                            ctx.debug("= Already tracked: state=%s path=%s", current_state, current_canon)
+                            continue
+
+                        if current_state == "review":
+                            ctx.debug("! Missing on disk (review); will requeue -> %s", current_canon)
+                        else:
+                            ctx.debug("! Missing on disk (library); leaving for reconcile -> %s", current_canon)
+                            stats["skipped_dupe"] += 1
+                            continue
+
+                    fname = canonical_name(taken_at, h, ext)
+                    dest = plan_nonclobber(REVIEW_ROOT, fname)
+
+                    if DRY_RUN:
+                        ctx.debug("[DRY] MOVE %s -> %s", p, dest)
                         stats["moved"] += 1
+                    else:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        moved_ok = False
+                        try:
+                            p.rename(dest)
+                            moved_ok = True
+                        except Exception as e1:
+                            try:
+                                shutil.copy2(p, dest)
+                                moved_ok = True
+                                try:
+                                    p.unlink()
+                                except Exception:
+                                    pass
+                            except Exception as e2:
+                                moved_ok = False
+                                if QUAR.get("move_failed", True):
+                                    q_path = maybe_quarantine(p, "move_failed", ingest_id, extra=f"{e1} | {e2}")
+                                    # Flip the row to quarantined since the move didn't succeed
+                                    now = datetime.utcnow().isoformat()
+                                    conn.execute(
+                                        """
+                                        UPDATE media
+                                        SET state='quarantine',
+                                            canonical_path=?,
+                                            quarantine_reason='move_failed',
+                                            updated_at=?
+                                        WHERE id=?
+                                        """,
+                                        (str(q_path) if q_path and not DRY_RUN else None, now, mid),
+                                    )
+                                    stats["q_counts"]["move_failed"] += 1
+                                    stats["quarantined"] += 1
 
-                conn.commit()
+                        if moved_ok:
+                            now = datetime.utcnow().isoformat()
+                            conn.execute(
+                                "UPDATE media SET state='review', canonical_path=?, updated_at=?, last_verified_at=? WHERE id=?",
+                                (str(dest), now, now, mid),
+                            )
+                            ctx.debug("MOVED %s -> %s", p, dest)
+                            stats["moved"] += 1
+
+                    conn.commit()
+
+                except Exception as ex:
+                    # Catch-all so one bad file doesn't kill the batch
+                    ctx.exception("Unhandled error while processing %s", p)
+                    continue
 
     finally:
         finish_ingest(conn, ingest_id)
@@ -891,8 +960,10 @@ def main():
     t0 = time.perf_counter()
 
     conn = open_db()
+    # upgrade columns if the DB pre-dates these fields
     ensure_column(conn, "sightings", "folder_hint", "TEXT")
     ensure_column(conn, "sightings", "ingest_id", "TEXT")
+    ensure_column(conn, "media", "quarantine_reason", "TEXT")
 
     # pick sources/paths (works with 'pc', 'other/trip1', absolute paths, etc.)
     try:
