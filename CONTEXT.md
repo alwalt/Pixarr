@@ -158,10 +158,6 @@ python scripts/ingest_pass.py other -q -vv --data-dir /path/to/data
 
 ---
 
-absolutely — here are a few tight “paste-ins” you can append to **context.md**.
-
----
-
 ### On-review duplicate policy (config + CLI)
 
 * Source of truth: `ingest.on_review_dupe` in `pixarr.toml` (`"quarantine"` | `"ignore"` | `"delete"`).
