@@ -14,6 +14,7 @@ Highlights:
 Requirements:
 - Python 3.9+ (uses tomli on ≤3.10)
 - exiftool on PATH
+- Pillow for content hashing of images (optional plugins: pillow-heif for HEIC, pillow-avif-plugin for AVIF)  # [CONTENT HASH]
 """
 
 import os
@@ -35,6 +36,20 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict
 from collections import defaultdict, Counter
 
+# --- optional image decoders for content hashing ---------------------------------------  # [CONTENT HASH]
+try:
+    from PIL import Image, ImageOps  # Pillow
+except Exception:
+    Image = None
+    ImageOps = None
+
+try:
+    # Enables Pillow to open HEIC/HEIF if installed
+    import pillow_heif  # type: ignore
+    pillow_heif.register_heif_opener()
+except Exception:
+    pillow_heif = None
+
 # ---------- Global toggles ----------
 DRY_RUN = True  # overridden by --write
 
@@ -43,6 +58,9 @@ SUPPORTED_EXT = {
     ".mp4", ".mov", ".m4v", ".avi", ".webp",
     ".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".rw2", ".orf", ".srw"
 }
+# Only attempt pixel-level content hashing on these image types (videos/RAW skipped for now)  # [CONTENT HASH]
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".gif", ".webp", ".heic", ".heif", ".avif"}  # avif needs pillow-avif-plugin
+
 GENERIC_FOLDERS = {"dcim", "misc", "export", "photos", "images", "img", "camera", "mobile", "iphone", "android"}
 
 JUNK_FILES = {".DS_Store", "Thumbs.db", "desktop.ini"}
@@ -65,6 +83,14 @@ QUAR: Dict[str, bool] = {}
 
 # exiftool (checked at runtime)
 EXIFTOOL_PATH = shutil.which("exiftool")
+
+# --- Duplicate quarantine subdir mapping ------------------------------------------------  # [DUPES]
+# We keep DB reasons distinct (in_library vs in_review) but use ONE folder on disk.
+REASON_TO_SUBDIR = {
+    "duplicate_in_library": "duplicate",
+    "duplicate_in_review": "duplicate",
+    # everything else maps to its own reason name
+}
 
 # ---------- Utilities ----------
 
@@ -92,6 +118,7 @@ def ensure_dirs() -> None:
     for d in [
         "Staging/pc", "Staging/other", "Staging/icloud", "Staging/sdcard",
         "Review", "Library", "Quarantine",
+        "Quarantine/duplicate",  # pre-create the unified duplicate folder     # [DUPES]
     ]:
         (DATA_DIR / "media" / d).mkdir(parents=True, exist_ok=True)
 
@@ -231,6 +258,37 @@ def is_media_candidate(p: Path) -> bool:
     # only look at extension here; let stat() decide file health
     return p.suffix.lower() in SUPPORTED_EXT
 
+# --- Content hash (decoded pixels, stable across EXIF/XMP edits) ------------------------  # [CONTENT HASH]
+def compute_image_content_sha256(path: Path) -> Optional[str]:
+    """
+    Return a SHA-256 hex digest of the decoded pixels for an image file.
+    - Applies EXIF orientation (so rotated vs not-rotated match).
+    - Converts everything to RGB deterministically.
+    - Flattens alpha on black to avoid ambiguity.
+    NOTE: This is NOT perceptual hashing. If pixels change (resize/crop/recompress),
+    the digest changes. Returns None if Pillow or decoder is unavailable.
+    """
+    if Image is None or ImageOps is None:
+        return None
+    try:
+        with Image.open(path) as im:
+            im.load()  # force decode to surface errors
+            im = ImageOps.exif_transpose(im)
+            if "A" in im.getbands():
+                # composite on opaque black, then drop alpha
+                base = Image.new("RGBA", im.size, (0, 0, 0, 255))
+                im = Image.alpha_composite(base, im.convert("RGBA")).convert("RGB")
+            else:
+                im = im.convert("RGB")
+            header = f"{im.mode}|{im.width}x{im.height}".encode("utf-8")
+            raw = im.tobytes()
+            h = hashlib.sha256()
+            h.update(header)
+            h.update(raw)
+            return h.hexdigest()
+    except Exception:
+        return None
+
 # Only capture/camera-origin dates. (File dates optionally added via flag)
 _DATE_KEYS = [
     "DateTimeOriginal",
@@ -358,8 +416,10 @@ def _write_quarantine_sidecar(dest: Path, payload: dict) -> None:
         pass
 
 def quarantine_file(src: Path, reason: str, ingest_id: str, extra: Optional[str] = None) -> Optional[Path]:
-    """Move/copy the src file to Quarantine/<reason>/ and write a tiny sidecar JSON."""
-    dest_dir = QUARANTINE_ROOT / reason
+    """Move/copy the src file to Quarantine/<mapped-subdir>/ and write a tiny sidecar JSON."""
+    # Map duplicate reasons to the unified 'duplicate' subdir; otherwise use the reason.  # [DUPES]
+    subdir = REASON_TO_SUBDIR.get(reason, reason)
+    dest_dir = QUARANTINE_ROOT / subdir
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = plan_nonclobber(dest_dir, src.name)
     try:
@@ -382,7 +442,7 @@ def quarantine_file(src: Path, reason: str, ingest_id: str, extra: Optional[str]
         "original_path": str(src),
         "quarantined_to": str(dest) if moved else None,
         "timestamp": datetime.utcnow().isoformat(),
-        "extra": extra,
+        "extra": extra,  # include dupe basis / canonical id info when provided        # [DUPES]
     }
     _write_quarantine_sidecar(dest if moved else dest_dir / (src.name + ".failed"), payload)
     return dest if moved else None
@@ -539,6 +599,7 @@ def upsert_media(conn: sqlite3.Connection, row: dict) -> Tuple[str, str, Optiona
     """
     Insert a media row or update existing by hash.
     Return (id, state, canonical_path).
+    NOTE: now includes content_sha256 column.                                   # [CONTENT HASH]
     """
     now = datetime.utcnow().isoformat()
     row.setdefault("added_at", now)
@@ -548,11 +609,11 @@ def upsert_media(conn: sqlite3.Connection, row: dict) -> Tuple[str, str, Optiona
         conn.execute(
             """
             INSERT INTO media (
-              id, hash_sha256, phash, ext, bytes, taken_at, tz_offset,
+              id, hash_sha256, phash, content_sha256, ext, bytes, taken_at, tz_offset,
               gps_lat, gps_lon, state, canonical_path,
               added_at, updated_at, xmp_written, quarantine_reason
             ) VALUES (
-              :id, :hash_sha256, :phash, :ext, :bytes, :taken_at, :tz_offset,
+              :id, :hash_sha256, :phash, :content_sha256, :ext, :bytes, :taken_at, :tz_offset,
               :gps_lat, :gps_lon, :state, :canonical_path,
               :added_at, :updated_at, :xmp_written, :quarantine_reason
             )
@@ -566,6 +627,7 @@ def upsert_media(conn: sqlite3.Connection, row: dict) -> Tuple[str, str, Optiona
             SET taken_at       = COALESCE(media.taken_at, :taken_at),
                 gps_lat        = COALESCE(media.gps_lat,  :gps_lat),
                 gps_lon        = COALESCE(media.gps_lon,  :gps_lon),
+                content_sha256 = COALESCE(:content_sha256, media.content_sha256),
                 state          = CASE
                                     WHEN media.state IN ('library','quarantine','deleted')
                                          THEN media.state
@@ -609,6 +671,45 @@ def already_finalized(conn: sqlite3.Connection, hash_hex: str) -> bool:
         (hash_hex,),
     )
     return cur.fetchone() is not None
+
+# [DUPES] helper: prefer library over review when matching by file or content hash
+def _find_canonical_by_filehash(conn: sqlite3.Connection, h: str) -> Optional[Tuple[str, str, Optional[str]]]:
+    """
+    Return (id, state, canonical_path) for the best match by exact file hash,
+    preferring 'library' over 'review'. None if not found.
+    """
+    row = conn.execute(
+        """
+        SELECT id, state, canonical_path
+        FROM media
+        WHERE hash_sha256 = ?
+          AND state IN ('library','review')
+        ORDER BY CASE state WHEN 'library' THEN 0 ELSE 1 END
+        LIMIT 1
+        """,
+        (h,),
+    ).fetchone()
+    return tuple(row) if row else None
+
+def _find_canonical_by_contenthash(conn: sqlite3.Connection, c: str) -> Optional[Tuple[str, str, Optional[str]]]:
+    """
+    Return (id, state, canonical_path) for the best match by content hash,
+    preferring 'library' over 'review'. None if not found.
+    """
+    if not c:
+        return None
+    row = conn.execute(
+        """
+        SELECT id, state, canonical_path
+        FROM media
+        WHERE content_sha256 = ?
+          AND state IN ('library','review')
+        ORDER BY CASE state WHEN 'library' THEN 0 ELSE 1 END
+        LIMIT 1
+        """,
+        (c,),
+    ).fetchone()
+    return tuple(row) if row else None
 
 # ---------- Date from filename + resolver ----------
 
@@ -755,7 +856,96 @@ def ingest_one_source(conn, source_label, staging_root, *, on_review_dupe: str, 
                     ext = p.suffix.lower()
                     hint = last_meaningful_folder(p.parent)
 
-                    # -------- capture time resolution --------
+                    # -------- [CONTENT HASH] compute pixel-level digest for images (if possible) -----
+                    content_sha256: Optional[str] = None
+                    if ext in IMAGE_EXT:
+                        content_sha256 = compute_image_content_sha256(p)
+                    # ---------------------------------------------------------------------------------
+
+                    # -------- [DUPES] Early duplicate resolution: exact file, then content ----------
+                    # 1) By exact file hash (prefer library over review)
+                    canonical = _find_canonical_by_filehash(conn, h)
+                    if canonical:
+                        canon_id, canon_state, _canon_path = canonical
+                        reason = "duplicate_in_library" if canon_state == "library" else "duplicate_in_review"
+                        basis = "file"
+                        # Policy: for duplicates in review, honor on_review_dupe; library always quarantined if enabled
+                        if reason == "duplicate_in_review" and on_review_dupe == "ignore":
+                            stats["updated"] += 1
+                            stats["skipped_dupe"] += 1
+                            now = datetime.utcnow().isoformat()
+                            conn.execute("UPDATE media SET last_verified_at=?, updated_at=? WHERE id=?", (now, now, canon_id))
+                            insert_sighting(conn, canon_id, p, name, source_label, hint, ingest_id)
+                            conn.commit()
+                            ctx.debug("= Already tracked (review, basis=file): %s", p, extra={"file_token": tok})
+                            continue
+                        elif reason == "duplicate_in_review" and on_review_dupe == "delete":
+                            stats["skipped_dupe"] += 1
+                            insert_sighting(conn, canon_id, p, name, source_label, hint, ingest_id)
+                            if DRY_RUN:
+                                ctx.info("[DRY] DELETE duplicate (review, basis=file): %s", p, extra={"file_token": tok})
+                            else:
+                                try:
+                                    p.unlink()
+                                except Exception:
+                                    stats["q_counts"]["move_failed"] += 1
+                                    maybe_quarantine(p, "move_failed", ingest_id, extra="delete_failed", source=source_label, file_token=tok)
+                                    stats["quarantined"] += 1
+                            conn.commit()
+                            continue
+                        else:
+                            if QUAR.get("dupes", True):
+                                stats["q_counts"][reason] += 1
+                                extra = f"basis={basis} dupe_of={canon_id}"
+                                maybe_quarantine(p, reason, ingest_id, extra=extra, source=source_label, file_token=tok)
+                                stats["quarantined"] += 1
+                            stats["skipped_dupe"] += 1
+                            insert_sighting(conn, canon_id, p, name, source_label, hint, ingest_id)
+                            conn.commit()
+                            continue
+
+                    # 2) By content hash (prefer library over review)
+                    canonical = _find_canonical_by_contenthash(conn, content_sha256) if content_sha256 else None
+                    if canonical:
+                        canon_id, canon_state, _canon_path = canonical
+                        reason = "duplicate_in_library" if canon_state == "library" else "duplicate_in_review"
+                        basis = "content"
+                        if reason == "duplicate_in_review" and on_review_dupe == "ignore":
+                            stats["updated"] += 1
+                            stats["skipped_dupe"] += 1
+                            now = datetime.utcnow().isoformat()
+                            conn.execute("UPDATE media SET last_verified_at=?, updated_at=? WHERE id=?", (now, now, canon_id))
+                            insert_sighting(conn, canon_id, p, name, source_label, hint, ingest_id)
+                            conn.commit()
+                            ctx.debug("= Already tracked (review, basis=content): %s", p, extra={"file_token": tok})
+                            continue
+                        elif reason == "duplicate_in_review" and on_review_dupe == "delete":
+                            stats["skipped_dupe"] += 1
+                            insert_sighting(conn, canon_id, p, name, source_label, hint, ingest_id)
+                            if DRY_RUN:
+                                ctx.info("[DRY] DELETE duplicate (review, basis=content): %s", p, extra={"file_token": tok})
+                            else:
+                                try:
+                                    p.unlink()
+                                except Exception:
+                                    stats["q_counts"]["move_failed"] += 1
+                                    maybe_quarantine(p, "move_failed", ingest_id, extra="delete_failed", source=source_label, file_token=tok)
+                                    stats["quarantined"] += 1
+                            conn.commit()
+                            continue
+                        else:
+                            if QUAR.get("dupes", True):
+                                stats["q_counts"][reason] += 1
+                                extra = f"basis={basis} dupe_of={canon_id}"
+                                maybe_quarantine(p, reason, ingest_id, extra=extra, source=source_label, file_token=tok)
+                                stats["quarantined"] += 1
+                            stats["skipped_dupe"] += 1
+                            insert_sighting(conn, canon_id, p, name, source_label, hint, ingest_id)
+                            conn.commit()
+                            continue
+                    # ---------------------------------------------------------------------------------
+
+                    # -------- capture time resolution (only for non-duplicates) --------
                     taken_at = resolve_taken_at(meta, name, ALLOW_FILENAME_DATES)
                     if not taken_at:
                         reason_code = "missing_datetime"
@@ -770,6 +960,7 @@ def ingest_one_source(conn, source_label, staging_root, *, on_review_dupe: str, 
                             "id": uuid_from_hash(h),
                             "hash_sha256": h,
                             "phash": None,
+                            "content_sha256": content_sha256,  # [CONTENT HASH]
                             "ext": ext,
                             "bytes": size,
                             "taken_at": None,
@@ -795,6 +986,7 @@ def ingest_one_source(conn, source_label, staging_root, *, on_review_dupe: str, 
                         "id": uuid_from_hash(h),
                         "hash_sha256": h,
                         "phash": None,
+                        "content_sha256": content_sha256,  # [CONTENT HASH]
                         "ext": ext,
                         "bytes": size,
                         "taken_at": taken_at,
@@ -812,14 +1004,15 @@ def ingest_one_source(conn, source_label, staging_root, *, on_review_dupe: str, 
                     mid, current_state, current_canon = upsert_media(conn, media_row)
                     insert_sighting(conn, mid, p, name, source_label, hint, ingest_id)
 
-                    # already in library
+                    # (legacy safety) exact-file dupes detected *after* upsert (should be rare now)
                     if already_finalized(conn, h):
                         stats["skipped_dupe"] += 1
-                        ctx.debug("= DUP in library: %s (%s)", p, h[:8], extra={"file_token": tok})
+                        ctx.debug("= DUP in library (late): %s (%s)", p, h[:8], extra={"file_token": tok})
                         if QUAR.get("dupes", True):
                             stats["q_counts"]["duplicate_in_library"] += 1
-                            maybe_quarantine(p, "duplicate_in_library", ingest_id, source=source_label, file_token=tok)
+                            maybe_quarantine(p, "duplicate_in_library", ingest_id, extra="basis=file (late)", source=source_label, file_token=tok)
                             stats["quarantined"] += 1
+                        conn.commit()
                         continue
 
                     if current_state in ("review", "library") and current_canon:
@@ -830,12 +1023,12 @@ def ingest_one_source(conn, source_label, staging_root, *, on_review_dupe: str, 
 
                         if not canon_missing:
                             if current_state == "library":
-                                # keep existing behavior for library dupes
                                 stats["skipped_dupe"] += 1
                                 if QUAR.get("dupes", True):
                                     stats["q_counts"]["duplicate_in_library"] += 1
-                                    maybe_quarantine(p, "duplicate_in_library", ingest_id, source=source_label, file_token=tok)
+                                    maybe_quarantine(p, "duplicate_in_library", ingest_id, extra="basis=file (late-state)", source=source_label, file_token=tok)
                                     stats["quarantined"] += 1
+                                conn.commit()
                                 continue
 
                             # current_state == "review"
@@ -846,34 +1039,35 @@ def ingest_one_source(conn, source_label, staging_root, *, on_review_dupe: str, 
                                     "UPDATE media SET last_verified_at=?, updated_at=? WHERE id=?",
                                     (now, now, mid),
                                 )
-                                ctx.debug("= Already tracked (review): %s", current_canon, extra={"file_token": tok})
+                                ctx.debug("= Already tracked (review, late): %s", current_canon, extra={"file_token": tok})
+                                conn.commit()
                                 continue
                             elif on_review_dupe == "quarantine":
                                 if QUAR.get("dupes", True):
                                     stats["q_counts"]["duplicate_in_review"] += 1
-                                    maybe_quarantine(p, "duplicate_in_review", ingest_id, source=source_label, file_token=tok)
+                                    maybe_quarantine(p, "duplicate_in_review", ingest_id, extra="basis=file (late-state)", source=source_label, file_token=tok)
                                     stats["quarantined"] += 1
                                 else:
-                                    # fall back to ignore if dupe quarantine disabled
                                     stats["updated"] += 1
                                     now = datetime.utcnow().isoformat()
                                     conn.execute(
                                         "UPDATE media SET last_verified_at=?, updated_at=? WHERE id=?",
                                         (now, now, mid),
                                     )
+                                conn.commit()
                                 continue
                             elif on_review_dupe == "delete":
                                 if DRY_RUN:
-                                    ctx.info("[DRY] DELETE duplicate (review): %s", p, extra={"file_token": tok})
+                                    ctx.info("[DRY] DELETE duplicate (review, late): %s", p, extra={"file_token": tok})
                                 else:
                                     try:
                                         p.unlink()
                                     except Exception:
-                                        # if delete fails, quarantine as move_failed for audit
                                         stats["q_counts"]["move_failed"] += 1
                                         maybe_quarantine(p, "move_failed", ingest_id, extra="delete_failed", source=source_label, file_token=tok)
                                         stats["quarantined"] += 1
                                 stats["skipped_dupe"] += 1
+                                conn.commit()
                                 continue
 
                     fname = canonical_name(taken_at, h, ext)
@@ -1052,6 +1246,7 @@ def main():
     ensure_column(conn, "sightings", "folder_hint", "TEXT")
     ensure_column(conn, "sightings", "ingest_id", "TEXT")
     ensure_column(conn, "media", "quarantine_reason", "TEXT")
+    ensure_column(conn, "media", "content_sha256", "TEXT")  # ensure the new column exists          # [CONTENT HASH]
 
     # pick sources/paths (works with 'pc', 'other/trip1', absolute paths, etc.)
     try:

@@ -16,8 +16,9 @@ PRAGMA user_version=1;
 -- ----------
 CREATE TABLE IF NOT EXISTS media (
   id               TEXT PRIMARY KEY,              -- UUID (string)
-  hash_sha256      TEXT UNIQUE NOT NULL,          -- dedup anchor
+  hash_sha256      TEXT UNIQUE NOT NULL,          -- dedup anchor (byte-for-byte file)
   phash            TEXT,                          -- optional perceptual hash
+  content_sha256   TEXT,                          -- [ADDED 2025-08-20] pixel-level digest (decoded content; stable across EXIF/XMP rewrites; NOT UNIQUE)
   ext              TEXT NOT NULL,                 -- .jpg .heic .mp4 ...
   bytes            INTEGER NOT NULL,
   taken_at         TEXT,                          -- ISO8601 (UTC or naive)
@@ -33,15 +34,16 @@ CREATE TABLE IF NOT EXISTS media (
   updated_at       TEXT NOT NULL,                 -- last update timestamp (UTC ISO8601)
   xmp_written      INTEGER DEFAULT 0,             -- 0/1 flag (written after library)
   -- quarantine metadata
-  quarantine_reason TEXT,                         -- why quarantined (e.g. 'missing_datetime','unsupported_ext')
+  quarantine_reason TEXT,                         -- why quarantined (e.g. 'missing_datetime','unsupported_ext','duplicate_content') [NOTE: added reason label support]
   -- deletion/verification (for reconcile scripts & audits)
   deleted_at       TEXT,                          -- when we marked it deleted
   last_verified_at TEXT,                          -- last time we saw the file on disk
   -- keep states constrained since we rebuild from file
   CHECK (state IN ('staging','review','library','quarantine','deleted'))
 );
-CREATE INDEX IF NOT EXISTS idx_media_taken_at ON media(taken_at);
-CREATE INDEX IF NOT EXISTS idx_media_state    ON media(state);
+CREATE INDEX IF NOT EXISTS idx_media_taken_at       ON media(taken_at);
+CREATE INDEX IF NOT EXISTS idx_media_state          ON media(state);
+CREATE INDEX IF NOT EXISTS idx_media_content_sha256 ON media(content_sha256) WHERE content_sha256 IS NOT NULL; -- [ADDED 2025-08-20] fast content-dupe lookup
 
 -- ----------
 -- Provenance: every path/name we've ever seen

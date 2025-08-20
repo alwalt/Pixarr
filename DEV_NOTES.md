@@ -1,7 +1,3 @@
-Absolutely—here’s a cleaned, consolidated **`DEV_NOTES.md`** that folds in the latest logging behavior and the `is_media_candidate` change, removes duplication, and tightens wording.
-
----
-
 # DEV\_NOTES.md
 
 ## 1) What this project is
@@ -28,7 +24,7 @@ scripts/
   pixarr_db.py               # simple DB utilities (legacy; keep for now)
   pixarr_query.py            # read-only CLI for DB (states, reasons, sightings, batches)
   reset_db.sh                # nuke & re-init DB (dev only)
-  make_test_zoo.sh           # synthesize a small "good + bad" test set
+  make_test_zoo.sh           # synthesize a small "good + bad" test set (legit JPEG/MP4 timestamps)
 tests/
   test_taken_resolver.py     # unit test for filename-date parsing
 ```
@@ -50,7 +46,14 @@ data/
       ...
     Review/                 # good items land here during ingest
     Library/                # finalized assets (out of scope for ingest_pass.py)
-    Quarantine/<reason>/    # problem items (write-mode only)
+    Quarantine/
+      duplicate/            # ← unified bucket for ALL duplicate reasons (see §“Quarantine & Review — TL;DR”)
+      missing_datetime/
+      stat_error/
+      move_failed/
+      zero_bytes/
+      unsupported_ext/
+      junk/
 ```
 
 ---
@@ -59,9 +62,9 @@ data/
 
 ```bash
 # 1) Dependencies
-brew install exiftool ffmpeg
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt   # includes Pillow
+pip install -r requirements.txt   # includes Pillow; install imageio-ffmpeg for the zoo script
+# exiftool must be on PATH for ingest (metadata read); e.g., macOS: brew install exiftool
 
 # 2) Initialize DB
 python scripts/init_db.py --data-dir /Volumes/Data/Pixarr/data
@@ -96,7 +99,7 @@ python scripts/ingest_pass.py other --heartbeat 200 -v --data-dir /Volumes/Data/
 Copy `pixarr.example.toml` → `pixarr.toml` at repo root. Key sections:
 
 * `[paths]` → `data_dir`
-* `[ingest]` → `dry_run_default`, `allow_file_dates`, `allow_filename_dates`
+* `[ingest]` → `dry_run_default`, `allow_file_dates`, `allow_filename_dates`, `on_review_dupe`
 * `[quarantine]` → toggles per reason (`junk`, `unsupported_ext`, `zero_bytes`, `stat_error`, `move_failed`, `dupes`, `missing_datetime`)
 
 CLI flags always override config.
@@ -145,9 +148,14 @@ For each file under selected Staging roots:
    * Optional file-date fallback (`--allow-file-dates`) when flag is given (wired via `_DATE_KEYS`).
 7. If no usable `taken_at` → `state='quarantine'`, `quarantine_reason='missing_datetime'`. In write-mode, file is moved under `Quarantine/missing_datetime/`; always recorded in DB.
 8. If good → upsert `media` (`state='review'`), add `sightings`, compute canonical name `YYYY-MM-DD_HH-MM-SS_<hash8>.<ext>`, and move to `Review/` (or log `[DRY] MOVE`).
-9. Summarize counts; log batches and examples.
+9. **Dupes handling (streamlined):**
 
-**Dedupe:** if an identical file is already in **library**, it’s treated as a dupe (optionally quarantined per policy). Same-hash sightings update DB without re-moving.
+   * **File-level dupes** (same `hash_sha256`) are detected across Review/Library.
+   * **Content dupes** (same pixels, different bytes) are supported by `content_sha256` **for decodable image formats** (e.g., JPEG/PNG).
+   * All duplicate sources are routed to **`Quarantine/duplicate/`** with a sidecar JSON noting `reason` and `extra` (basis and target id).
+10. Summarize counts; log batches and examples.
+
+> **Note:** We are **not** computing content hashes for **HEIC/HEIF** right now. File-level dupes still work for HEIC; content-dup analysis applies to formats we decode (e.g., JPEG/PNG).
 
 ---
 
@@ -189,7 +197,7 @@ except Exception as e:
 
 **Metrics:** “scanned” counts only candidate media (by suffix). Quarantine totals include all reasons (junk, unsupported, etc.), so `quarantined` can exceed `scanned`.
 
-*Edge ideas:* if you want a dedicated `symlink_error`, detect `p.is_symlink()` prior to `stat()`.
+*Edge idea:* if you want a dedicated `symlink_error`, detect `p.is_symlink()` prior to `stat()`.
 
 ---
 
@@ -207,7 +215,7 @@ except Exception as e:
 
 **media**
 
-* `id` (UUID from sha256), `hash_sha256` (unique), `ext`, `bytes`
+* `id` (UUID from sha256), `hash_sha256` (unique), **`content_sha256` (nullable; decoded-pixels digest for images)**, `ext`, `bytes`
 * `taken_at`, `tz_offset`, `gps_lat`, `gps_lon`
 * `state` ∈ `('staging','review','library','quarantine','deleted')`
 * `canonical_path`
@@ -222,13 +230,17 @@ except Exception as e:
 
 * batches → `id`, `source`, `started_at`, `finished_at`, `notes`
 
-See `db/schema.sql` for full DDL and views (`v_review_queue`, `v_needs_xmp`, `v_deleted`).
+**View for content dupes**
+
+* `v_duplicate_content` groups by `content_sha256` and surfaces clusters with `COUNT(*) > 1`.
+
+See `db/schema.sql` for full DDL and views (`v_review_queue`, `v_needs_xmp`, `v_deleted`, `v_duplicate_content`).
 
 ---
 
 ## 11) DB migrations (dev)
 
-If your DB predates `quarantine_reason`:
+If your DB predates these columns:
 
 **Option A (dev only):**
 
@@ -239,9 +251,29 @@ bash scripts/reset_db.sh  # WARNING: wipes data/db/app.sqlite3
 **Option B (manual migrate):**
 
 ```sql
+-- existing earlier migration
 ALTER TABLE media ADD COLUMN quarantine_reason TEXT;
-CREATE INDEX IF NOT EXISTS idx_media_state ON media(state);
+
+-- NEW: content hash support
+ALTER TABLE media ADD COLUMN content_sha256 TEXT;
+CREATE INDEX IF NOT EXISTS idx_media_content_hash ON media(content_sha256);
+
+-- keep these common indexes
+CREATE INDEX IF NOT EXISTS idx_media_state    ON media(state);
 CREATE INDEX IF NOT EXISTS idx_media_taken_at ON media(taken_at);
+
+-- (re)create the analysis view
+DROP VIEW IF EXISTS v_duplicate_content;
+CREATE VIEW v_duplicate_content AS
+SELECT
+  content_sha256,
+  COUNT(*)        AS count_rows,
+  MIN(added_at)   AS first_seen,
+  MAX(updated_at) AS last_seen
+FROM media
+WHERE content_sha256 IS NOT NULL
+GROUP BY content_sha256
+HAVING COUNT(*) > 1;
 ```
 
 The ingest script auto-adds safe columns on `sightings` (`folder_hint`, `ingest_id`).
@@ -268,7 +300,7 @@ Subcommands:
 
 ## 13) Troubleshooting
 
-* **`exiftool` not found** → `brew install exiftool` and re-run.
+* **`exiftool` not found** → install it and re-run (`brew install exiftool` on macOS).
 * **Invalid EXIF sentinel** → `_parse_exif_dt` ignores `0000…/0001…/1970…`; update `ingest_pass.py` if you still see errors.
 * **Don’t see `[DRY] MOVE` in file logs** → bump to `-vv` or `--log-level=DEBUG`. Logs are in `<data_dir>/logs/`.
 * **Frequent `missing_datetime`** → try `--allow-filename-dates`. If still missing, timestamps are truly absent; curate in quarantine.
@@ -293,7 +325,7 @@ python -m pytest -q
 ```
 
 * `tests/test_taken_resolver.py` covers filename → datetime parsing.
-* Add tests around `_parse_exif_dt`, quarantine routing, canonical name collisions.
+* Add tests around `_parse_exif_dt`, quarantine routing, canonical name collisions when convenient.
 
 ---
 
@@ -317,6 +349,7 @@ python -m pytest -q
 * Importers (iCloud, Takeout, SD, WhatsApp)
 * Persisted/batched exiftool
 * Metrics (throughput, quarantine rate, reasons)
+* **Content hashing for HEIC/HEIF** (future; file-hash dupes already supported)
 
 ---
 
@@ -337,35 +370,39 @@ python scripts/pixarr_query.py --data-dir /Volumes/Data/Pixarr/data quarantine -
 
 # Sightings by pattern
 python scripts/pixarr_query.py --data-dir /Volumes/Data/Pixarr/data sightings --like 'IMG_07%' --limit 100
+
+# Inspect content-dup clusters
+sqlite3 /Volumes/Data/Pixarr/data/db/app.sqlite3 "SELECT * FROM v_duplicate_content ORDER BY last_seen DESC LIMIT 20;"
 ```
 
 ---
 
 ## 19) Test fixture (“zoo”)
 
-Use `scripts/make_test_zoo.sh` to synthesize a small set of good/bad files in `Staging/other/_testcase_zoo`:
+Use `scripts/make_test_zoo.sh` to synthesize a small set of good/bad files in `Staging/other/_testcase_zoo`.
+This version creates **legit timestamps** in both the JPEG and MP4 without depending on system ffmpeg:
 
-* EXIF-valid JPEG → **good**
-* MP4 with QuickTime date → **good**
-* Duplicate of JPEG → **dupe path/update** behavior
-* Filename-timestamp JPEG (no EXIF) → **missing\_datetime** (unless `--allow-filename-dates`)
-* PNG/GIF → **missing\_datetime**
-* Zero-byte `.heic` → **zero\_bytes**
-* Broken symlink `.mov` → **stat\_error**
-* `.pdf` → **unsupported\_ext**
-* `.DS_Store`, `._junk.bin`, `Thumbs.db` → **junk**
+* **JPEG (good)** – `DateTimeOriginal` + `CreateDate` written at save time (Pillow).
+* **MP4 (good)** – `creation_time` baked at encode time using **Python-managed ffmpeg** (`imageio-ffmpeg`).
+* **Duplicate of JPEG** – tests dupe path/update behavior.
+* **Filename-timestamp JPEG (no EXIF)** – `missing_datetime` (unless `--allow-filename-dates`).
+* **PNG/GIF** – typically `missing_datetime`.
+* **Zero-byte `.heic`** – `zero_bytes`.
+* **Broken symlink `.mov`** – `stat_error`.
+* **`.pdf`** – `unsupported_ext`.
+* **Junk** – `.DS_Store`, `._junk.bin`, `Thumbs.db`.
 
 Quick runs:
 
 ```bash
-python scripts/ingest_pass.py Staging/other/_testcase_zoo -v
-python scripts/ingest_pass.py Staging/other/_testcase_zoo --allow-filename-dates -v
-python scripts/ingest_pass.py Staging/other/_testcase_zoo -vv
+# Create the zoo (requires: pip install Pillow imageio-ffmpeg)
+scripts/make_test_zoo.sh --data-dir /Volumes/Data/Pixarr/data
+
+# Ingest
+python scripts/ingest_pass.py Staging/other/_testcase_zoo -v --data-dir /Volumes/Data/Pixarr/data
+python scripts/ingest_pass.py Staging/other/_testcase_zoo --allow-filename-dates -v --data-dir /Volumes/Data/Pixarr/data
+python scripts/ingest_pass.py Staging/other/_testcase_zoo -vv --data-dir /Volumes/Data/Pixarr/data
 ```
-
----
-
-Here’s a **short drop-in** you can paste into `DEV_NOTES.md` under a “Quarantine & Review” section.
 
 ---
 
@@ -385,17 +422,33 @@ Here’s a **short drop-in** you can paste into `DEV_NOTES.md` under a “Quaran
 * `missing_datetime` — no usable capture time from EXIF/QuickTime (filename only if `--allow-filename-dates`).
 * `move_failed` — couldn’t move/copy to Review.
 * `duplicate_in_library` — hash already finalized in Library.
-* `duplicate_in_review` — hash already present in Review (see policy below).
+* `duplicate_in_review` — hash already present in Review.
+* `duplicate_content` — **pixels identical** to an existing item (metadata-only differences; supported for formats we decode, e.g., JPEG/PNG).
+  **All duplicates** route to a **single folder**: `Quarantine/duplicate/`.
 
-> **DB rule of thumb:** We **insert media rows** for *candidate media* (by suffix) when we can hash it: i.e., normal Review moves and quarantines like `stat_error`, `zero_bytes`, `missing_datetime`, `move_failed`, `duplicate_*`.
-> We **do not** insert rows for `junk` / `unsupported_ext`.
+> **Sidecar JSON**: every quarantined file gets `<name>.quarantine.json` with:
+>
+> ```json
+> {
+>   "reason": "duplicate_in_review" | "duplicate_in_library" | "duplicate_content",
+>   "extra":  "basis=file|content dupe_of=<media_id>",
+>   "original_path": "...",
+>   "quarantined_to": "...",
+>   "ingest_id": "...",
+>   "timestamp": "..."
+> }
+> ```
+>
+> Use this to see whether it was a **file** or **content** duplicate and which media row is canonical.
+
+> **DB rule of thumb:** We insert media rows for *candidate media* when we can hash it (normal Review moves and quarantines like `stat_error`, `zero_bytes`, `missing_datetime`, `move_failed`, `duplicate_*`). We do **not** insert rows for `junk` / `unsupported_ext`.
 
 **Duplicates in Review (configurable)**
 
 * Policy is `ingest.on_review_dupe` in `pixarr.toml` (or `--on-review-dupe`):
 
-  * `ignore` — mark existing row `last_verified_at`, leave source file alone.
-  * `quarantine` *(default)* — move source to `Quarantine/duplicate_in_review/`.
+  * `ignore` — mark existing row `last_verified_at`, leave source file alone (still logs a sighting).
+  * `quarantine` *(default)* — move source to **`Quarantine/duplicate/`**.
   * `delete` — delete source (or quarantine as `move_failed` if delete fails).
 * Library dupes always count as `duplicate_in_library` (and may be quarantined if `quarantine.dupes = true`).
 
@@ -443,25 +496,23 @@ python scripts/ingest_pass.py other --on-review-dupe=ignore -v
 
 Tiny DB viewer
 
-scripts/show_media.py prints one media row + related records.
+`scripts/show_media.py` prints one media row + related records.
 
 Default DB resolution order (no --db):
 
-PIXARR_DB → file
-
-PIXARR_DATA_DIR → db/app.sqlite3
-
-pixarr.toml [paths].data_dir → db/app.sqlite3
-
-./data/db/app.sqlite3 (repo) → ./data/db/app.sqlite3 (cwd)
+* `PIXARR_DB` → file
+* `PIXARR_DATA_DIR` → `db/app.sqlite3`
+* `pixarr.toml [paths].data_dir` → `db/app.sqlite3`
+* `./data/db/app.sqlite3` (repo) → `./data/db/app.sqlite3` (cwd)
 
 Usage:
 
-#   python scripts/show_media.py --id bb6d33dc-91f3-5dd1-bfc9-d5e2fc1024bd
-#   python scripts/show_media.py --hash 7151bea9f6a5...
-#   python scripts/show_media.py --hash-prefix 242053ae
-#   python scripts/show_media.py --path "/Volumes/Data/Pixarr/data/media/Staging/other/_testcase_zoo/dupe_of_exif_ok.jpg"
-#   PIXARR_DATA_DIR=/Volumes/Data/Pixarr/data python scripts/show_media.py --hash-prefix 242053ae
-
+```
+python scripts/show_media.py --id bb6d33dc-91f3-5dd1-bfc9-d5e2fc1024bd
+python scripts/show_media.py --hash 7151bea9f6a5...
+python scripts/show_media.py --hash-prefix 242053ae
+python scripts/show_media.py --path "/Volumes/Data/Pixarr/data/media/Staging/other/_testcase_zoo/dupe_of_exif_ok.jpg"
+PIXARR_DATA_DIR=/Volumes/Data/Pixarr/data python scripts/show_media.py --hash-prefix 242053ae
+```
 
 ---
