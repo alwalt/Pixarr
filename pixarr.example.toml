@@ -11,6 +11,12 @@
 [ingest]
 # Start in dry-run mode unless --write is passed.
 dry_run_default = true
+# What to do when a file with the same hash already exists in Review/
+#   ignore     -> mark verified, leave staging file alone
+#   quarantine -> move staging file to Quarantine/duplicate_in_review (requires [quarantine].dupes=true)
+#   delete     -> delete staging file (falls back to quarantine:move_failed if delete fails)
+on_review_dupe = "quarantine"  # or "ignore" or "delete"
+
 
 # Capture-time resolution policy:
 # 1) EXIF/QuickTime (always tried first)

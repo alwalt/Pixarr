@@ -364,3 +364,104 @@ python scripts/ingest_pass.py Staging/other/_testcase_zoo -vv
 ```
 
 ---
+
+Here’s a **short drop-in** you can paste into `DEV_NOTES.md` under a “Quarantine & Review” section.
+
+---
+
+## Quarantine & Review — TL;DR
+
+**What we do**
+
+* Files under `Staging/*` are screened by **suffix only** (`is_media_candidate`).
+* Health is checked via `stat()` and EXIF/QuickTime; good items go to **Review/**, problems go to **Quarantine/<reason>/** (write-mode) and are logged either way.
+
+**Reasons & semantics**
+
+* `junk` — system clutter (e.g., `.DS_Store`, `Thumbs.db`, `._*`). *Not inserted into DB.*
+* `unsupported_ext` — truly non-media types (e.g., `.pdf`). *Not inserted into DB.*
+* `stat_error` — can’t `stat()`/read (dangling symlink, perms, I/O).
+* `zero_bytes` — 0-byte with a supported suffix.
+* `missing_datetime` — no usable capture time from EXIF/QuickTime (filename only if `--allow-filename-dates`).
+* `move_failed` — couldn’t move/copy to Review.
+* `duplicate_in_library` — hash already finalized in Library.
+* `duplicate_in_review` — hash already present in Review (see policy below).
+
+> **DB rule of thumb:** We **insert media rows** for *candidate media* (by suffix) when we can hash it: i.e., normal Review moves and quarantines like `stat_error`, `zero_bytes`, `missing_datetime`, `move_failed`, `duplicate_*`.
+> We **do not** insert rows for `junk` / `unsupported_ext`.
+
+**Duplicates in Review (configurable)**
+
+* Policy is `ingest.on_review_dupe` in `pixarr.toml` (or `--on-review-dupe`):
+
+  * `ignore` — mark existing row `last_verified_at`, leave source file alone.
+  * `quarantine` *(default)* — move source to `Quarantine/duplicate_in_review/`.
+  * `delete` — delete source (or quarantine as `move_failed` if delete fails).
+* Library dupes always count as `duplicate_in_library` (and may be quarantined if `quarantine.dupes = true`).
+
+**Logging (final behavior)**
+
+* Quarantines are **WARNING**; dry-run uses the same level with a `[DRY]` prefix.
+* Matrix:
+
+  * `-q` → console silent; file **INFO only** (WARNING+ suppressed in file)
+  * default → console **INFO only**; file **INFO+WARNING**
+  * `-v` → console **INFO+WARNING**; file **INFO+WARNING**
+  * `-vv` → console **DEBUG/INFO/WARNING**; file **DEBUG/INFO/WARNING**
+  * `--log-level=X` → both handlers use **exactly X** (no extra filters)
+
+**Config snippet**
+
+```toml
+[ingest]
+dry_run_default = true
+allow_filename_dates = false
+allow_file_dates = false
+on_review_dupe = "quarantine"  # or "ignore" | "delete"
+
+[quarantine]
+junk = true
+unsupported_ext = true
+zero_bytes = true
+stat_error = true
+move_failed = true
+dupes = true
+missing_datetime = true
+```
+
+**CLI examples**
+
+```bash
+# Prefer filename timestamps too
+python scripts/ingest_pass.py other --allow-filename-dates -v
+
+# Set review-dupe policy for this run only
+python scripts/ingest_pass.py other --on-review-dupe=ignore -v
+```
+
+---
+
+Tiny DB viewer
+
+scripts/show_media.py prints one media row + related records.
+
+Default DB resolution order (no --db):
+
+PIXARR_DB → file
+
+PIXARR_DATA_DIR → db/app.sqlite3
+
+pixarr.toml [paths].data_dir → db/app.sqlite3
+
+./data/db/app.sqlite3 (repo) → ./data/db/app.sqlite3 (cwd)
+
+Usage:
+
+#   python scripts/show_media.py --id bb6d33dc-91f3-5dd1-bfc9-d5e2fc1024bd
+#   python scripts/show_media.py --hash 7151bea9f6a5...
+#   python scripts/show_media.py --hash-prefix 242053ae
+#   python scripts/show_media.py --path "/Volumes/Data/Pixarr/data/media/Staging/other/_testcase_zoo/dupe_of_exif_ok.jpg"
+#   PIXARR_DATA_DIR=/Volumes/Data/Pixarr/data python scripts/show_media.py --hash-prefix 242053ae
+
+
+---

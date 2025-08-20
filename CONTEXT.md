@@ -157,3 +157,19 @@ python scripts/ingest_pass.py other -q -vv --data-dir /path/to/data
 * Fixture: `scripts/make_test_zoo.sh` to reproduce edge cases quickly
 
 ---
+
+absolutely — here are a few tight “paste-ins” you can append to **context.md**.
+
+---
+
+### On-review duplicate policy (config + CLI)
+
+* Source of truth: `ingest.on_review_dupe` in `pixarr.toml` (`"quarantine"` | `"ignore"` | `"delete"`).
+* CLI override: `--on-review-dupe=<policy>` (wins over config).
+* Behavior:
+
+  * `ignore` → update `last_verified_at`, leave source file.
+  * `quarantine` *(default)* → `Quarantine/duplicate_in_review/`.
+  * `delete` → try `unlink()`; on failure, quarantine as `move_failed`.
+
+---

@@ -313,6 +313,15 @@ def uuid_from_hash(hash_hex: str) -> str:
     """Deterministic UUID from SHA-256 (stable per content)."""
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, hash_hex))
 
+def file_token_for(p: Path, h: Optional[str] = None) -> str:
+    if h:
+        return h[:8]
+    try:
+        return hashlib.sha1(str(p).encode("utf-8", "ignore")).hexdigest()[:8]
+    except Exception:
+        return "-"
+
+
 def canonical_name(taken_at_iso: str, hash_hex: str, ext: str) -> str:
     """YYYY-MM-DD_HH-MM-SS_hashprefix.ext (hashprefix = first 8 chars)."""
     dt = datetime.fromisoformat(taken_at_iso.replace("Z", "+00:00"))
@@ -378,27 +387,27 @@ def quarantine_file(src: Path, reason: str, ingest_id: str, extra: Optional[str]
     _write_quarantine_sidecar(dest if moved else dest_dir / (src.name + ".failed"), payload)
     return dest if moved else None
 
-def maybe_quarantine(src: Path, reason: str, ingest_id: str, extra: Optional[str] = None, source: Optional[str] = None) -> Optional[Path]:
-    """
-    Quarantine with consistent logging.
-    - Dry-run and write: identical log levels (DRY just adds a prefix).
-    - Quarantines are WARNING; visibility on console depends on handler filters.
-    """
+def maybe_quarantine(
+    src: Path,
+    reason: str,
+    ingest_id: str,
+    *,
+    extra: Optional[str] = None,
+    source: str,
+    file_token: Optional[str] = None
+) -> Optional[Path]:
     level = logging.WARNING
     msg = f"QUARANTINE {src} -> {reason} ({extra or ''})"
-    _extra = {"ingest_id": ingest_id, "source": source or "-"}
-
+    _extra = {"ingest_id": ingest_id, "source": source, "file_token": file_token or ingest_id[:8]}
     if DRY_RUN:
         LOGGER.log(level, f"[DRY] {msg}", extra=_extra)
         return None
-
     q = quarantine_file(src, reason, ingest_id, extra=extra)
     if q:
         LOGGER.log(level, f"{msg} -> {q}", extra=_extra)
         return q
-    else:
-        LOGGER.error(f"QUARANTINE FAILED for {src} ({reason})", extra=_extra)
-        return None
+    LOGGER.error(f"QUARANTINE FAILED for {src} ({reason})", extra=_extra)
+    return None
 
 
 def setup_logging(data_dir: Path, logs_dir_arg: Optional[str], verbose: int,
@@ -416,6 +425,8 @@ def setup_logging(data_dir: Path, logs_dir_arg: Optional[str], verbose: int,
         def filter(self, record: logging.LogRecord) -> bool:
             if not hasattr(record, "source"):   record.source = "-"
             if not hasattr(record, "ingest_id"): record.ingest_id = "-"
+             # Default file_token to ingest_id unless the log call overrides it
+            if not hasattr(record, "file_token"): record.file_token = record.ingest_id
             return True
 
     class MaxLevelFilter(logging.Filter):
@@ -488,6 +499,7 @@ def setup_logging(data_dir: Path, logs_dir_arg: Optional[str], verbose: int,
                     "name": record.name,
                     "source": getattr(record, "source", None),
                     "ingest_id": getattr(record, "ingest_id", None),
+                    "file_token": getattr(record, "file_token", None),
                 }
                 if record.exc_info:
                     payload["exc"] = self.formatException(record.exc_info)
@@ -495,7 +507,7 @@ def setup_logging(data_dir: Path, logs_dir_arg: Optional[str], verbose: int,
         fh.setFormatter(JsonFormatter())
     else:
         fh.setFormatter(logging.Formatter(
-            "%(asctime)sZ [%(levelname)s] [%(source)s:%(ingest_id)s] %(message)s",
+            "%(asctime)sZ [%(levelname)s] [%(source)s:%(file_token)s] %(message)s",
             datefmt="%Y-%m-%dT%H:%M:%S"
         ))
     logger.addHandler(fh)
@@ -612,7 +624,7 @@ def _taken_from_filename(name: str) -> Optional[datetime]:
     """
     s = name
 
-    # PHOTO-YYYY-MM-DD-HH-MM-SS (allow separators -, _, space and :, . between time parts)
+    # PHOTO-YYYY-MM-DD-HH-MM-SS
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})[-_ T]+(\d{2})[-_.:](\d{2})[-_.:](\d{2})", s)
     if m:
         y, mo, d, H, M, S = map(int, m.groups())
@@ -663,8 +675,7 @@ def resolve_taken_at(meta: dict, filename: str, allow_filename_dates: bool) -> O
     return None
 
 # ---------- Ingest core ----------
-
-def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500):
+def ingest_one_source(conn, source_label, staging_root, *, on_review_dupe: str, note=None, heartbeat=500):
     """Run a full ingest pass for one staging root and return stats for end-of-run summary."""
     stats = {
         "label": source_label,
@@ -701,7 +712,7 @@ def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500
                     if name in JUNK_FILES or any(name.startswith(pref) for pref in JUNK_PREFIXES):
                         if QUAR.get("junk", True):
                             stats["q_counts"]["junk"] += 1
-                            maybe_quarantine(p, "junk", ingest_id, extra=("appledouble" if name.startswith("._") else "system_file"), source=source_label)
+                            maybe_quarantine(p, "junk", ingest_id, extra=("appledouble" if name.startswith("._") else "system_file"), source=source_label, file_token=file_token_for(p))
                             stats["quarantined"] += 1
                         continue
 
@@ -709,7 +720,7 @@ def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500
                     if not is_media_candidate(p):
                         if QUAR.get("unsupported_ext", True):
                             stats["q_counts"]["unsupported_ext"] += 1
-                            maybe_quarantine(p, "unsupported_ext", ingest_id, extra=p.suffix.lower())
+                            maybe_quarantine(p, "unsupported_ext", ingest_id, extra=p.suffix.lower(), source=source_label, file_token=file_token_for(p))
                             stats["quarantined"] += 1
                         continue
 
@@ -727,18 +738,19 @@ def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500
                     except Exception as e:
                         if QUAR.get("stat_error", True):
                             stats["q_counts"]["stat_error"] += 1
-                            maybe_quarantine(p, "stat_error", ingest_id, extra=str(e), source=source_label)
+                            maybe_quarantine(p, "stat_error", ingest_id, extra=str(e), source=source_label, file_token=file_token_for(p))
                             stats["quarantined"] += 1
                         continue
 
                     if size == 0:
                         if QUAR.get("zero_bytes", True):
                             stats["q_counts"]["zero_bytes"] += 1
-                            maybe_quarantine(p, "zero_bytes", ingest_id, source=source_label)
+                            maybe_quarantine(p, "zero_bytes", ingest_id, source=source_label, file_token=file_token_for(p))
                             stats["quarantined"] += 1
                         continue
 
                     h = sha256_file(p)
+                    tok = file_token_for(p, h)
                     meta = exiftool_json(p)
                     ext = p.suffix.lower()
                     hint = last_meaningful_folder(p.parent)
@@ -751,7 +763,7 @@ def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500
 
                         q_dest = None
                         if QUAR.get("missing_datetime", True):
-                            q_dest = maybe_quarantine(p, reason_code, ingest_id, extra=reason_msg, source=source_label)
+                            q_dest = maybe_quarantine(p, reason_code, ingest_id, extra=reason_msg,  source=source_label, file_token=tok)
 
                         # track in DB as quarantined (only for *media-like* files where we have a hash)
                         media_row = {
@@ -803,10 +815,10 @@ def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500
                     # already in library
                     if already_finalized(conn, h):
                         stats["skipped_dupe"] += 1
-                        ctx.debug("= DUP in library: %s (%s)", p, h[:8])
+                        ctx.debug("= DUP in library: %s (%s)", p, h[:8], extra={"file_token": tok})
                         if QUAR.get("dupes", True):
                             stats["q_counts"]["duplicate_in_library"] += 1
-                            maybe_quarantine(p, "duplicate_in_library", ingest_id, source=source_label)
+                            maybe_quarantine(p, "duplicate_in_library", ingest_id, source=source_label, file_token=tok)
                             stats["quarantined"] += 1
                         continue
 
@@ -817,27 +829,58 @@ def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500
                             canon_missing = True
 
                         if not canon_missing:
-                            stats["updated"] += 1
-                            now = datetime.utcnow().isoformat()
-                            conn.execute(
-                                "UPDATE media SET last_verified_at=?, updated_at=? WHERE id=?",
-                                (now, now, mid),
-                            )
-                            ctx.debug("= Already tracked: state=%s path=%s", current_state, current_canon)
-                            continue
+                            if current_state == "library":
+                                # keep existing behavior for library dupes
+                                stats["skipped_dupe"] += 1
+                                if QUAR.get("dupes", True):
+                                    stats["q_counts"]["duplicate_in_library"] += 1
+                                    maybe_quarantine(p, "duplicate_in_library", ingest_id, source=source_label, file_token=tok)
+                                    stats["quarantined"] += 1
+                                continue
 
-                        if current_state == "review":
-                            ctx.debug("! Missing on disk (review); will requeue -> %s", current_canon)
-                        else:
-                            ctx.debug("! Missing on disk (library); leaving for reconcile -> %s", current_canon)
-                            stats["skipped_dupe"] += 1
-                            continue
+                            # current_state == "review"
+                            if on_review_dupe == "ignore":
+                                stats["updated"] += 1
+                                now = datetime.utcnow().isoformat()
+                                conn.execute(
+                                    "UPDATE media SET last_verified_at=?, updated_at=? WHERE id=?",
+                                    (now, now, mid),
+                                )
+                                ctx.debug("= Already tracked (review): %s", current_canon, extra={"file_token": tok})
+                                continue
+                            elif on_review_dupe == "quarantine":
+                                if QUAR.get("dupes", True):
+                                    stats["q_counts"]["duplicate_in_review"] += 1
+                                    maybe_quarantine(p, "duplicate_in_review", ingest_id, source=source_label, file_token=tok)
+                                    stats["quarantined"] += 1
+                                else:
+                                    # fall back to ignore if dupe quarantine disabled
+                                    stats["updated"] += 1
+                                    now = datetime.utcnow().isoformat()
+                                    conn.execute(
+                                        "UPDATE media SET last_verified_at=?, updated_at=? WHERE id=?",
+                                        (now, now, mid),
+                                    )
+                                continue
+                            elif on_review_dupe == "delete":
+                                if DRY_RUN:
+                                    ctx.info("[DRY] DELETE duplicate (review): %s", p, extra={"file_token": tok})
+                                else:
+                                    try:
+                                        p.unlink()
+                                    except Exception:
+                                        # if delete fails, quarantine as move_failed for audit
+                                        stats["q_counts"]["move_failed"] += 1
+                                        maybe_quarantine(p, "move_failed", ingest_id, extra="delete_failed", source=source_label, file_token=tok)
+                                        stats["quarantined"] += 1
+                                stats["skipped_dupe"] += 1
+                                continue
 
                     fname = canonical_name(taken_at, h, ext)
                     dest = plan_nonclobber(REVIEW_ROOT, fname)
 
                     if DRY_RUN:
-                        ctx.debug("[DRY] MOVE %s -> %s", p, dest)
+                        ctx.debug("[DRY] MOVE %s -> %s", p, dest, extra={"file_token": tok})
                         stats["moved"] += 1
                     else:
                         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -856,7 +899,7 @@ def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500
                             except Exception as e2:
                                 moved_ok = False
                                 if QUAR.get("move_failed", True):
-                                    q_path = maybe_quarantine(p, "move_failed", ingest_id, extra=f"{e1} | {e2}", source=source_label)
+                                    q_path = maybe_quarantine(p, "move_failed", ingest_id, extra=f"{e1} | {e2}", source=source_label, file_token=tok)
                                     # Flip the row to quarantined since the move didn't succeed
                                     now = datetime.utcnow().isoformat()
                                     conn.execute(
@@ -879,14 +922,14 @@ def ingest_one_source(conn, source_label, staging_root, note=None, heartbeat=500
                                 "UPDATE media SET state='review', canonical_path=?, updated_at=?, last_verified_at=? WHERE id=?",
                                 (str(dest), now, now, mid),
                             )
-                            ctx.debug("MOVED %s -> %s", p, dest)
+                            ctx.debug("MOVED %s -> %s", p, dest, extra={"file_token": tok})
                             stats["moved"] += 1
 
                     conn.commit()
 
-                except Exception as ex:
+                except Exception:
                     # Catch-all so one bad file doesn't kill the batch
-                    ctx.exception("Unhandled error while processing %s", p)
+                    ctx.exception("Unhandled error while processing %s", p, extra={"file_token": file_token_for(p)})
                     continue
 
     finally:
@@ -906,6 +949,8 @@ def main():
     cfg_paths = cfg.get("paths", {})
     cfg_ingest = cfg.get("ingest", {})
     cfg_quar = cfg.get("quarantine", {})
+    default_on_review_dupe = cfg_ingest.get("on_review_dupe", "quarantine")
+
 
     parser = argparse.ArgumentParser(description="Pixarr: ingest media from staging folders.")
     parser.add_argument("sources", nargs="*", help="Subset of sources to ingest (pc, other, icloud, sdcard)")
@@ -935,7 +980,17 @@ def main():
     parser.add_argument("--heartbeat", type=int, default=500,
                         help="Emit a progress line every N scanned files (default 500)")
 
+    parser.add_argument("--on-review-dupe", choices=["ignore", "quarantine", "delete"], 
+                        help=f"Policy when a duplicate already exists in Review " f"(default from config: {default_on_review_dupe})")
+
+    # ---- after cfg_* are read, before parser.parse_args()
+    valid_dupe_policies = {"ignore", "quarantine", "delete"}     # the only allowed values
+    default_on_review_dupe = cfg_ingest.get("on_review_dupe", "quarantine")  # read from pixarr.toml (or use 'quarantine')
+    if default_on_review_dupe not in valid_dupe_policies:        # if the config had a typo/bad value…
+        default_on_review_dupe = "quarantine"                    # …fall back safely (can’t log yet)
+
     args = parser.parse_args()
+    on_review_dupe = args.on_review_dupe or default_on_review_dupe
 
     # setup logging
     global LOGGER
@@ -1012,7 +1067,12 @@ def main():
 
     all_stats = []
     for label, path in selected:
-        stats = ingest_one_source(conn, label, path, note=args.note, heartbeat=args.heartbeat)
+        stats = ingest_one_source(
+            conn, label, path,
+            on_review_dupe=on_review_dupe,
+            note=args.note,
+            heartbeat=args.heartbeat
+        )
         all_stats.append(stats)
 
     conn.close()
