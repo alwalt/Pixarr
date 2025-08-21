@@ -516,3 +516,33 @@ PIXARR_DATA_DIR=/Volumes/Data/Pixarr/data python scripts/show_media.py --hash-pr
 ```
 
 ---
+
+## Thumbnail Caching
+
+To keep the React frontend responsive when browsing large folders of media, the backend generates and serves cached thumbnails.
+
+* **Location:**
+  All thumbnails are stored under `data/thumb-cache/`.
+  File names are derived from the media file path (hashed/escaped to avoid collisions).
+
+* **Creation:**
+
+  * When the frontend requests an image preview (via `/preview` or `/thumbnail` routes), the backend checks if a cached thumbnail exists.
+  * If not, it uses Pillow (Python Imaging Library) to generate a downsized JPEG/PNG and writes it to `thumb-cache`.
+  * Subsequent requests serve the cached file directly for speed.
+
+* **Cleanup:**
+
+  * Thumbnails are **ephemeral**: they can always be regenerated from the original media.
+  * You can safely delete the `thumb-cache/` folder at any time; the system will lazily rebuild missing thumbnails on demand.
+  * In production, you may want a cronjob or maintenance script to prune very old cache entries.
+
+* **Git Ignore:**
+  Since cached thumbnails are artifacts, **they should not be version-controlled**. Ensure the following line is in `.gitignore`:
+
+  ```
+  # Thumbnail cache (safe to delete)
+  data/thumb-cache/
+  ```
+
+---
