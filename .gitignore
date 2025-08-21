@@ -1,9 +1,12 @@
 # Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 *.pyd
-*.so
+.venv/
+venv/
+.env
+*.log
 
 # Virtual environments
 .venv/
@@ -15,6 +18,11 @@ venv/
 .AppleDouble
 .Spotlight-V100
 .Trashes
+
+# editor/system
+Thumbs.db
+.vscode/
+.idea/
 
 # Databases and journals
 data/db/*.sqlite3
@@ -37,3 +45,23 @@ data/media/Quarantine/
 
 # test fixtures
 data/media/Staging/other/_testcase_zoo/
+
+# node / react
+node_modules/
+dist/
+build/
+.cache/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# fastapi/sqlite
+*.sqlite3
+*.db
+
+# editor/system
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+data/thumb-cache/
