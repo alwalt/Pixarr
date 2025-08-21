@@ -15,9 +15,13 @@ const theme = {
   accentBorder: "#3b82f6",
 };
 
-// Keep a single radius value so header + aside stay consistent
+// // Keep a single radius value so header + aside stay consistent
 const RADIUS = 10;
-const RAIL_W = 56; // width of the collapsed "single icon" rail
+const BTN_SIZE = 40;
+const RAIL_PAD = 8;
+const RAIL_BORDER = 1;
+const RAIL_EXTRA = 2; // small breathing room so it never feels cramped
+const RAIL_W = BTN_SIZE + RAIL_PAD * 2 + RAIL_BORDER + RAIL_EXTRA;
 
 type Tab = "staging" | "review";
 type AsideMode = "about" | "preview"; // extend later as you add more functions
@@ -154,27 +158,28 @@ export default function App() {
           minWidth: 0,
           background: theme.surface,
           borderLeft: `1px solid ${theme.border}`,
-          padding: 12,
+          padding: 0,
           boxSizing: "border-box",
           borderTopLeftRadius: RADIUS,
           borderBottomLeftRadius: RADIUS,
           color: theme.text,
-          overflow: "auto",
-          borderRadius: 10,        // optional; remove if you want a perfectly flush column
+          overflow: "hidden",
+          // borderRadius: 10,        // optional; remove if you want a perfectly flush column
           display: "grid",
-          gridTemplateColumns: asideOpen ? `${RAIL_W}px 1fr` : `${RAIL_W}px`, // rail + panel
+          gridTemplateColumns: asideOpen ? `${RAIL_W}px 1fr` : `${RAIL_W}px`, // rail + panel'
         }}
       >
         {/* -------- Icon Rail (fixed width, always visible, same position) -------- */}
         <div
           style={{
-            width: RAIL_W,
-            borderRight: `1px solid ${theme.border}`,
+            width: "100%",
+            // borderRight: `1px solid ${theme.border}`,
+            borderRight: `${RAIL_BORDER}px solid ${theme.border}`,
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
             gap: 8,
-            padding: 8,
+            padding: RAIL_PAD,
             boxSizing: "border-box",
             background: theme.surface,
           }}
@@ -192,8 +197,8 @@ export default function App() {
                 aria-label={item.label}
                 aria-expanded={expanded}
                 style={{
-                  width: 40,
-                  height: 40,
+                  width: BTN_SIZE,
+                  height: BTN_SIZE,
                   borderRadius: 10,
                   border: `1px solid ${active ? theme.accentBorder : theme.border}`,
                   background: active ? theme.accent : theme.cardBg,
