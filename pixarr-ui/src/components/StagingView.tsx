@@ -260,7 +260,7 @@ export default function StagingView({ theme }: { theme: Theme }) {
       </div>
 
       {/* content: grid + preview */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr minmax(360px, 40%)", gap: 12, minHeight: 0 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr minmax(360px, 40%)", gap: 12, minHeight: 0, paddingBottom: 8, }}>
         {/* LEFT: grid */}
         <div
           style={{
@@ -276,6 +276,7 @@ export default function StagingView({ theme }: { theme: Theme }) {
             boxSizing: "border-box",
             background: theme.surface,
             minHeight: 0,
+            alignItems: "start",
           }}
         >
           {error && <div style={{ gridColumn: "1 / -1", color: "#fca5a5" }}>{error}</div>}
