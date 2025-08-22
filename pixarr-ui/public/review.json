@@ -1,0 +1,19 @@
+[
+  {
+    "id": "abc123",
+    "canonical_path": "/sample-images/sample1.jpg",
+    "taken_at": "2024-08-01T12:34:56"
+  },
+  {
+    "id": "def456",
+    "canonical_path": "/sample-images/sample2.jpg",
+    "taken_at": "2024-08-02T09:10:11",
+    "gps_lat": 37.7749,
+    "gps_lon": -122.4194
+  },
+  {
+    "id": "ghi789",
+    "canonical_path": "/data/media/Review/2024-08-03_18-05-33_d34db33f.png",
+    "taken_at": null
+  }
+]

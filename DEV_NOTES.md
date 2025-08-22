@@ -516,3 +516,157 @@ PIXARR_DATA_DIR=/Volumes/Data/Pixarr/data python scripts/show_media.py --hash-pr
 ```
 
 ---
+
+## Thumbnail Caching
+
+To keep the React frontend responsive when browsing large folders of media, the backend generates and serves cached thumbnails.
+
+* **Location:**
+  All thumbnails are stored under `data/thumb-cache/`.
+  File names are derived from the media file path (hashed/escaped to avoid collisions).
+
+* **Creation:**
+
+  * When the frontend requests an image preview (via `/preview` or `/thumbnail` routes), the backend checks if a cached thumbnail exists.
+  * If not, it uses Pillow (Python Imaging Library) to generate a downsized JPEG/PNG and writes it to `thumb-cache`.
+  * Subsequent requests serve the cached file directly for speed.
+
+* **Cleanup:**
+
+  * Thumbnails are **ephemeral**: they can always be regenerated from the original media.
+  * You can safely delete the `thumb-cache/` folder at any time; the system will lazily rebuild missing thumbnails on demand.
+  * In production, you may want a cronjob or maintenance script to prune very old cache entries.
+
+* **Git Ignore:**
+  Since cached thumbnails are artifacts, **they should not be version-controlled**. Ensure the following line is in `.gitignore`:
+
+  ```
+  # Thumbnail cache (safe to delete)
+  data/thumb-cache/
+  ```
+
+---
+
+awesome — here’s a **drop-in section** you can paste into `DEV_NOTES.md` to document the FastAPI refactor, config via TOML, how to run, endpoints, and gotchas.
+
+---
+
+## Backend API (FastAPI) — structure & runbook
+
+### Folder layout (API only)
+
+```
+pixarr-api/
+└─ app/
+   ├─ __init__.py
+   ├─ main.py                    # wires the app; no endpoints here
+   ├─ core/
+   │  ├─ __init__.py
+   │  └─ config.py               # loads paths + extensions from TOML
+   ├─ repositories/
+   │  ├─ __init__.py
+   │  └─ db.py                   # sqlite connector (uses DB_PATH from config)
+   ├─ utils/
+   │  ├─ __init__.py
+   │  ├─ http.py                 # safe_rel_under, abs_url
+   │  └─ thumbs.py               # serve_or_build_thumb
+   ├─ schemas/
+   │  ├─ __init__.py
+   │  └─ media.py                # Pydantic models
+   └─ api/
+      ├─ __init__.py
+      └─ routes/
+         ├─ __init__.py
+         ├─ review.py            # /api/review + /media/* + /thumb/review/*
+         └─ staging.py           # /api/staging/* + /staging/* + /thumb/staging/*
+```
+
+### `app/main.py` (tiny, boring wiring)
+
+```python
+# app/main.py — only app wiring (keep it boring)
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.api.routes import review, staging  # routers define endpoints
+
+app = FastAPI(title="Pixarr API", version="0.3")
+
+# CORS for the React dev server (Vite on :5173)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# JSON API routes (live under /api/*)
+app.include_router(review.api_router,  prefix="/api")
+app.include_router(staging.api_router, prefix="/api")
+
+# "Public" file routes (raw bytes for <img>/<video>, no /api prefix)
+app.include_router(review.public_router)
+app.include_router(staging.public_router)
+```
+
+> **Why “public”?** they serve bytes (originals/thumbs) directly to the browser; safe GETs, cacheable, and separate from JSON.
+
+### Config via TOML
+
+* The API reads `PIXARR_CONFIG` (env var) **or** defaults to `app/pixarr.toml`.
+* Extensions are normalized (case-insensitive, leading dot added).
+* **`SUPPORTED_EXT` is derived from** `image ∪ video ∪ raw` (so RAW can appear in listings if you want).
+* Legacy stats rule is preserved: **RAW is also counted as IMAGE**.
+
+**`app/pixarr.toml` example**
+
+```toml
+[paths]
+data_dir = "/Volumes/Data/Pixarr/data"
+review_subdir  = "media/Review"
+staging_subdir = "media/Staging"
+thumb_subdir   = "thumb-cache"
+# (optional) db_path = "db/app.sqlite3"
+
+[staging.roots]
+pc     = "pc"
+icloud = "icloud"
+sdcard = "sdcard"
+other  = "other"
+
+[ext]
+image = ["jpg","jpeg","png","tif","tiff","gif","webp","heic","heif","avif"]
+video = ["mp4","mov","m4v","avi","webm","mkv"]
+raw   = ["dng","cr2","cr3","nef","arw","raf","rw2","orf","srw"]
+# SUPPORTED_EXT is derived from image|video|raw; no need to specify "supported"
+```
+
+> **Note:** `DB_PATH` is restored at `DATA_DIR/db/app.sqlite3` (or set `paths.db_path` in TOML).
+
+### Endpoints (current)
+
+**API (JSON)**
+
+* `GET /api/review?limit=&offset=&q=` → list Review items (with `media_url`/`thumb_url`)
+* `GET /api/staging/roots` → list configured roots (e.g., `["icloud","pc"]`)
+* `GET /api/staging/list?root=&path=` → list dirs/files under a staging root/path
+* `GET /api/staging/stats?root=&path=` → counts for the **current** dir (non-recursive): images/videos/raw/other/dirs/total\_files
+  *(RAW increments both `images` and `raw` for compatibility.)*
+
+**Public (bytes)**
+
+* `GET /media/{path}` → serve Review originals
+* `GET /thumb/review/{path}?h=220` → serve/caches Review thumbs
+* `GET /staging/{root}/{path}` → serve Staging originals
+* `GET /thumb/staging/{root}/{path}?h=220` → serve/caches Staging thumbs
+
+### How to run (dev)
+
+```bash
+# From repo root (parent of app/)
+python -m uvicorn app.main:app --reload --port 8000 --reload-dir app
+
+# Use a specific TOML (optional)
+PIXARR_CONFIG=/path/to/pixarr.toml \
+python -m uvicorn app.main:app --reload --port 8000 --reload-dir app
+```

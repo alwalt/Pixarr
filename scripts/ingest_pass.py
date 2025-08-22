@@ -53,13 +53,74 @@ except Exception:
 # ---------- Global toggles ----------
 DRY_RUN = True  # overridden by --write
 
-SUPPORTED_EXT = {
-    ".jpg", ".jpeg", ".heic", ".png", ".tif", ".tiff", ".gif",
-    ".mp4", ".mov", ".m4v", ".avi", ".webp",
-    ".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".rw2", ".orf", ".srw"
-}
-# Only attempt pixel-level content hashing on these image types (videos/RAW skipped for now)  # [CONTENT HASH]
-IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".gif", ".webp", ".heic", ".heif", ".avif"}  # avif needs pillow-avif-plugin
+# Defaults used only if a list is missing in config
+DEFAULT_IMAGES = [
+    "jpg", "jpeg", "png", "tif", "tiff", "gif", "webp", "heic", "heif", "avif"
+]
+DEFAULT_RAW = [
+    "dng", "cr2", "cr3", "nef", "arw", "raf", "rw2", "orf", "srw"
+]
+DEFAULT_VIDEOS = [
+    "mp4", "mov", "m4v", "avi", "webm", "mkv"
+]
+
+def _norm_ext_list(items, *, default):
+    """
+    Normalize a list of extensions:
+      - strip whitespace, lowercase
+      - ensure a leading dot ('.jpg')
+      - drop empties
+    Returns a set like {'.jpg', '.png'}
+    """
+    source = items if items is not None else default
+    out: set[str] = set()
+    for s in source:
+        if not s:
+            continue
+        s = str(s).strip().lower()
+        if not s:
+            continue
+        if not s.startswith("."):
+            s = "." + s
+        out.add(s)
+    return out
+
+# ----------------------------------------------------------------------------------------
+# Formats from config
+# ----------------------------------------------------------------------------------------
+
+def _formats_from_cfg_dict(cfg: dict) -> tuple[set[str], set[str], set[str]]:
+    """
+    Normalize formats from an in-memory config dict.
+    Expected structure:
+      [formats]
+      images = ["jpg", "png", ...]
+      raw    = ["dng", "cr3", ...]
+      videos = ["mp4", "mov", ...]
+    Falls back to DEFAULT_* if keys/section are missing.
+    """
+    fmts = (cfg.get("formats") or {})
+    images = _norm_ext_list(fmts.get("images"), default=DEFAULT_IMAGES)
+    raw    = _norm_ext_list(fmts.get("raw"),    default=DEFAULT_RAW)
+    videos = _norm_ext_list(fmts.get("videos"), default=DEFAULT_VIDEOS)
+    return images, raw, videos
+
+def _load_formats_from_config(config_path: Path) -> tuple[set[str], set[str], set[str]]:
+    """
+    Load formats via the shared load_config() helper (single source of truth).
+    Returns sets with leading dots.
+    """
+    cfg = load_config(config_path)  # {} on missing/parse error
+    return _formats_from_cfg_dict(cfg)
+
+# -------------------------------------------------------------------------------------------------
+# Note: we initialize formats to defaults at import time (safe).
+#       In main() we override them from pixarr.toml to keep a single source of truth.
+# -------------------------------------------------------------------------------------------------
+IMAGE_EXT: set[str]  = _norm_ext_list(DEFAULT_IMAGES,  default=DEFAULT_IMAGES)  # non-RAW images (for pixel hash)
+RAW_EXT: set[str]    = _norm_ext_list(DEFAULT_RAW,     default=DEFAULT_RAW)     # RAW (counted as "pictures"; not thumbed/hashed)
+VIDEO_EXT: set[str]  = _norm_ext_list(DEFAULT_VIDEOS,  default=DEFAULT_VIDEOS)
+SUPPORTED_EXT: set[str] = IMAGE_EXT | RAW_EXT | VIDEO_EXT   # everything we accept during ingest
 
 GENERIC_FOLDERS = {"dcim", "misc", "export", "photos", "images", "img", "camera", "mobile", "iphone", "android"}
 
@@ -579,7 +640,7 @@ def setup_logging(data_dir: Path, logs_dir_arg: Optional[str], verbose: int,
 # ---------- DB ops ----------
 
 def begin_ingest(conn: sqlite3.Connection, source: str, note: Optional[str] = None) -> str:
-    """Create an ingests row and return its UUID."""
+    """Create a media ingest row and return its UUID."""
     ingest_id = str(uuid.uuid4())
     conn.execute(
         "INSERT INTO ingests (id, source, started_at, notes) VALUES (?, ?, ?, ?)",
@@ -817,7 +878,7 @@ def ingest_one_source(conn, source_label, staging_root, *, on_review_dupe: str, 
                             stats["quarantined"] += 1
                         continue
 
-                    # unsupported extensions
+                    # unsupported extensions (driven by config-overridden SUPPORTED_EXT)
                     if not is_media_candidate(p):
                         if QUAR.get("unsupported_ext", True):
                             stats["q_counts"]["unsupported_ext"] += 1
@@ -858,7 +919,7 @@ def ingest_one_source(conn, source_label, staging_root, *, on_review_dupe: str, 
 
                     # -------- [CONTENT HASH] compute pixel-level digest for images (if possible) -----
                     content_sha256: Optional[str] = None
-                    if ext in IMAGE_EXT:
+                    if ext in IMAGE_EXT:  # RAWs are NOT in IMAGE_EXT (we subtract RAW from images)
                         content_sha256 = compute_image_content_sha256(p)
                     # ---------------------------------------------------------------------------------
 
@@ -1136,8 +1197,9 @@ def ingest_one_source(conn, source_label, staging_root, *, on_review_dupe: str, 
 # ---------- Main ----------
 
 def main():
-    # Load config first
-    cfg = load_config(repo_root() / "pixarr.toml")
+    # Load config first (single read)
+    cfg_path = repo_root() / "pixarr.toml"
+    cfg = load_config(cfg_path)
 
     # Read defaults from config (fall back to current behavior)
     cfg_paths = cfg.get("paths", {})
@@ -1145,6 +1207,16 @@ def main():
     cfg_quar = cfg.get("quarantine", {})
     default_on_review_dupe = cfg_ingest.get("on_review_dupe", "quarantine")
 
+    # -------------------------------------------------------------------------
+    # OVERRIDE extension sets from config so ingest + API/UI are consistent
+    # -------------------------------------------------------------------------
+    global IMAGE_EXT, RAW_EXT, VIDEO_EXT, SUPPORTED_EXT
+    _images_cfg, _raw_cfg, _videos_cfg = _formats_from_cfg_dict(cfg)
+    # IMAGE_EXT should exclude RAW (non-RAW images only) for pixel hashing:
+    IMAGE_EXT = _images_cfg - _raw_cfg
+    RAW_EXT   = _raw_cfg
+    VIDEO_EXT = _videos_cfg
+    SUPPORTED_EXT = IMAGE_EXT | RAW_EXT | VIDEO_EXT   # everything we accept
 
     parser = argparse.ArgumentParser(description="Pixarr: ingest media from staging folders.")
     parser.add_argument("sources", nargs="*", help="Subset of sources to ingest (pc, other, icloud, sdcard)")
@@ -1175,7 +1247,7 @@ def main():
                         help="Emit a progress line every N scanned files (default 500)")
 
     parser.add_argument("--on-review-dupe", choices=["ignore", "quarantine", "delete"], 
-                        help=f"Policy when a duplicate already exists in Review " f"(default from config: {default_on_review_dupe})")
+                        help=f"Policy when a duplicate already exists in Review (default from config: {default_on_review_dupe})")
 
     # ---- after cfg_* are read, before parser.parse_args()
     valid_dupe_policies = {"ignore", "quarantine", "delete"}     # the only allowed values
@@ -1238,6 +1310,7 @@ def main():
     log(f"DATA_DIR = {DATA_DIR}")
     log(f"Effective quarantine: {QUAR}")
     log(f"allow_filename_dates={ALLOW_FILENAME_DATES}, allow_file_dates={'ModifyDate' in _DATE_KEYS}")
+    log(f"Formats -> images(non-RAW)={sorted(IMAGE_EXT)}, raw={sorted(RAW_EXT)}, videos={sorted(VIDEO_EXT)}")
 
     t0 = time.perf_counter()
 
