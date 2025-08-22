@@ -260,7 +260,7 @@ export default function StagingView({ theme }: { theme: Theme }) {
       </div>
 
       {/* content: grid + preview */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr minmax(360px, 40%)", gap: 12, minHeight: 0, paddingBottom: 8, }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr minmax(360px, 40%)", gap: 8, minHeight: 0, paddingBottom: 0, }}>
         {/* LEFT: grid */}
         <div
           style={{
@@ -450,7 +450,7 @@ export default function StagingView({ theme }: { theme: Theme }) {
 
                   return (
                     <>
-                      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                      <table className="exif-table" style={{ width: "100%", borderCollapse: "collapse" }}>
                         <tbody>
                           {visible.map(([k, v]) => (
                             <tr key={k} style={{ borderBottom: `1px solid ${theme.border}` }}>

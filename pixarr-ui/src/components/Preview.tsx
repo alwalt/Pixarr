@@ -187,7 +187,7 @@ export function BuiltInExifPanel({
           {item && !fetchExif && <div style={{ color: "#6b7280" }}>No EXIF fetcher provided.</div>}
           {err && <div style={{ color: "#dc2626" }}>Failed to load EXIF: {err}</div>}
           {data && (
-            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <table className="exif-table" style={{ width: "100%", borderCollapse: "collapse" }}>
               <tbody>
                 {Object.entries(data).map(([k, v]) => (
                   <tr key={k} style={{ borderBottom: "1px solid #f3f4f6" }}>

@@ -670,3 +670,121 @@ python -m uvicorn app.main:app --reload --port 8000 --reload-dir app
 PIXARR_CONFIG=/path/to/pixarr.toml \
 python -m uvicorn app.main:app --reload --port 8000 --reload-dir app
 ```
+
+---
+
+
+## Components (frontend)
+
+* `StagingView.tsx`
+  Grid of items (folders + media) with a right-hand **preview panel** (image/video + EXIF).
+  Fetches:
+
+  * `GET /api/staging/roots`
+  * `GET /api/staging/list?root=&path=`
+  * `GET /api/staging/stats?root=&path=`
+  * `GET /api/staging/exif?root=&path=` (on selection)
+    Selection is mapped to a `PreviewItem` for the preview.
+
+* `Preview.tsx`
+
+  * `PreviewShell` — layout/shell used across screens (media on left, slots for header/side/footer).
+  * `PreviewCanvas` — decides **image vs video** and uses **thumb** for HEIC (`/thumb/...` with `?h=`).
+  * `BuiltInExifPanel` — generic EXIF table (collapsible).
+
+* `Thumb.tsx`
+  Tiny card preview (image/video). Used in grids for fast scrolling.
+
+* `ReviewView.tsx`, `QuarantineView.tsx`, `LibraryView.tsx`
+  Placeholders wired to top tabs. Follow `StagingView` pattern; reuse `PreviewShell`.
+
+* `App.tsx`
+  Two-column layout (main + right **aside**). Tabs: **Staging / Review / Quarantine / Library**.
+  Aside has an icon rail (About / Settings). Preview lives **inside the main** (not the aside).
+
+## Data flow & types
+
+* **Types**:
+  `StagingEntry` → items from `/list`.
+  `PreviewItem` → minimal fields for preview: `{ name, is_dir, media_url?, thumb_url?, ext?, rel_path }`.
+
+* **Selected → Preview**:
+
+  ```ts
+  const selectedPreview = useMemo<PreviewItem | null>(() =>
+    selected && !selected.is_dir
+      ? {
+          name: selected.name,
+          is_dir: false,
+          media_url: selected.media_url ?? undefined,
+          thumb_url: selected.thumb_url ?? undefined,
+          ext: selected.name.split(".").pop()?.toLowerCase(),
+          rel_path: selected.rel_path,
+        }
+      : null,
+    [selected]
+  );
+  ```
+
+* **EXIF fetch**:
+
+  ```ts
+  async function fetchExif(item: PreviewItem) {
+    const params = new URLSearchParams({ root, path: item.rel_path, compact: "true" });
+    const r = await fetch(`${API_BASE}/api/staging/exif?${params.toString()}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json(); // pass-through keys (EXIF:*, QuickTime:*, Basic:*)
+  }
+  ```
+
+* **Preview source (image/video)**
+
+  * Video: use `media_url`.
+  * Image/HEIC: prefer `thumb_url?h=1200` (server JPEG).
+  * Fallback: `media_url`.
+
+## Backend expectations (staging)
+
+* `GET /api/staging/roots` → `["icloud","pc","other","whatsapp", ...]`
+* `GET /api/staging/list` → `StagingEntry[]` (includes absolute `media_url`, `thumb_url`)
+* `GET /api/staging/stats` → counts for pills
+* `GET /api/staging/exif` → flat dict of metadata (exiftool first, Pillow fallback) plus `Basic:*` fields
+  Public file routes:
+
+  * `/staging/{root}/{path}` (original)
+  * `/thumb/staging/{root}/{path}?h=220` (JPEG thumb/cache; works for HEIC)
+
+## Styling notes
+
+* Grid cards no longer stretch: container uses `alignContent: "start"` to keep short lists tidy.
+* EXIF table: add `className="exif-table"`; CSS:
+
+  ```css
+  .exif-table td:first-child { text-align: left; }
+  ```
+* Minor spacing: bottom padding on the main app root (`paddingBottom: 6`) to avoid flush edges.
+
+## Reuse pattern (other views)
+
+When building Review/Quarantine/Library:
+
+1. Fetch rows for that area.
+2. Render grid with `Thumb`.
+3. Maintain a `selected` item and compute a `PreviewItem` via `useMemo`.
+4. Drop in:
+
+   ```tsx
+   <PreviewShell
+     item={selectedPreview}
+     header={({ item }) => <div>{item ? item.name : "Select a file"}</div>}
+     sidePanel={() => <BuiltInExifPanel item={selectedPreview} fetchExif={fetchExif} />}
+     footer={() => null}
+   />
+   ```
+5. Swap the sidePanel actions per area (e.g., “Delete from Staging”, “Move to Library”, edit metadata, etc.).
+
+## HEIC support
+
+Handled via the **thumb** endpoint. The browser displays JPEGs returned by `/thumb/...`; originals remain HEIC on disk.
+
+---

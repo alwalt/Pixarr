@@ -1,6 +1,12 @@
+// src/App.tsx
 import { useState, useMemo } from "react";
-import ReviewView from "./components/ReviewView";
 import StagingView from "./components/StagingView";
+import ReviewView from "./components/ReviewView";
+// If you haven't created these yet, keep the stubs below or add real files:
+import QuarantineView from "./components/QuarantineView";
+import LibraryView from "./components/LibraryView";
+import "./App.css";
+
 
 /** Dark theme tokens */
 const theme = {
@@ -15,27 +21,24 @@ const theme = {
   accentBorder: "#3b82f6",
 };
 
-// // Keep a single radius value so header + aside stay consistent
+// Layout tokens
 const RADIUS = 10;
 const BTN_SIZE = 40;
 const RAIL_PAD = 8;
 const RAIL_BORDER = 1;
-const RAIL_EXTRA = 2; // small breathing room so it never feels cramped
+const RAIL_EXTRA = 2;
 const RAIL_W = BTN_SIZE + RAIL_PAD * 2 + RAIL_BORDER + RAIL_EXTRA;
 
-type Tab = "staging" | "review";
-type AsideMode = "about" | "settings"; // extend later as you add more functions
+type Tab = "staging" | "review" | "quarantine" | "library";
+type AsideMode = "about" | "settings";
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("staging");
 
-  // ⬇️ Collapsible aside: when collapsed, right column is a thin rail (single icon).
+  // Collapsible aside
   const [asideOpen, setAsideOpen] = useState<boolean>(true);
   const [asideMode, setAsideMode] = useState<AsideMode>("about");
 
-  // App grid columns depend on collapse state:
-  // - Expanded: left 3fr, right 1fr
-  // - Collapsed: left 1fr, right RAIL_W
   const appCols = useMemo(
     () => (asideOpen ? "3fr 1fr" : `1fr ${RAIL_W}px`),
     [asideOpen]
@@ -62,18 +65,11 @@ export default function App() {
     );
   };
 
-  // Icon rail items — using emoji (“🛈”) style
   const railItems = [
-  { mode: "about" as const,    icon: "🛈", label: "About / Instructions" },
-  { mode: "settings" as const, icon: "⚙️", label: "Settings" },
-];
+    { mode: "about" as const,    icon: "🛈", label: "About / Instructions" },
+    { mode: "settings" as const, icon: "⚙️", label: "Settings" },
+  ];
 
-
-  // const toggleAside = () => setAsideOpen((v) => !v);
-  // Clicking an icon:
-  // - If collapsed → open and set that mode
-  // - If expanded + different mode → switch mode
-  // - If expanded + same mode → collapse
   function onRailClick(next: AsideMode) {
     if (!asideOpen) {
       setAsideMode(next);
@@ -84,14 +80,10 @@ export default function App() {
       setAsideMode(next);
       return;
     }
-    // same mode while open -> collapse
     setAsideOpen(false);
   }
 
   return (
-    // Viewport grid:
-    // Rows: [header (auto), content (1fr)]
-    // Cols: [main (3fr), aside (1fr)]
     <div
       id="app-root"
       style={{
@@ -100,14 +92,14 @@ export default function App() {
         display: "grid",
         gridTemplateRows: "auto 1fr",
         gridTemplateColumns: appCols,
-        columnGap: 8,           // visual gutter between main and aside
+        columnGap: 8,
         overflow: "hidden",
         background: theme.appBg,
         color: theme.text,
+        paddingBottom: 6,
       }}
     >
-      {/* HEADER — lives only in LEFT column, Row 1 */}
-      {/* This ensures the aside can sit next to it in the RIGHT column from the very top. */}
+      {/* HEADER (left column) */}
       <div
         id="app-header"
         style={{
@@ -122,18 +114,21 @@ export default function App() {
           borderBottomRightRadius: RADIUS,
         }}
       >
-        <h1 style={{ margin: "0 0 4px 0", color: theme.text }}>pixarr</h1>
-        <p className="muted" style={{ margin: 0, color: theme.muted }}>
-          automatic importer for personal photos and videos: watch sources, normalize metadata, dedupe, and organize.
+        <h1 style={{ margin: "0 0 4px 0", color: theme.text, textAlign: "left" }}>pixarr</h1>
+        <p className="muted" style={{ margin: 0, color: theme.muted , textAlign: "left"}}>
+          automatic importer for personal photos and videos: watch sources, normalize metadata,
+          dedupe, and organize.
         </p>
 
         <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
           {tabBtn("staging", "Staging")}
           {tabBtn("review", "Review")}
+          {tabBtn("quarantine", "Quarantine")}
+          {tabBtn("library", "Library")}
         </div>
       </div>
 
-      {/* MAIN CONTENT — LEFT column, Row 2 */}
+      {/* MAIN CONTENT (left column) */}
       <div
         style={{
           gridRow: "2 / 3",
@@ -143,17 +138,21 @@ export default function App() {
           overflow: "hidden",
         }}
       >
-        {tab === "staging" ? <StagingView theme={theme} /> : <ReviewView />}
+        {tab === "staging" ? (
+          <StagingView theme={theme} />
+        ) : tab === "review" ? (
+          <ReviewView theme={theme} />
+        ) : tab === "quarantine" ? (
+          <QuarantineView theme={theme} />
+        ) : (
+          <LibraryView theme={theme} />
+        )}
       </div>
 
-      {/* ASIDE — right column spans BOTH rows (continuous from top to bottom). 
-          Inside the aside, the FIRST column is a fixed-width icon rail (RAIL_W),
-          which stays in the SAME position whether collapsed or expanded.
-          When collapsed: aside column is exactly RAIL_W wide → only rail visible.
-          When expanded: aside column grows → rail (RAIL_W) + panel (1fr). */}
+      {/* ASIDE (right column spans both rows) */}
       <div
         style={{
-          gridRow: "1 / -1",      // 👈 span header + content
+          gridRow: "1 / -1",
           gridColumn: "2 / 3",
           minHeight: 0,
           minWidth: 0,
@@ -165,16 +164,16 @@ export default function App() {
           borderBottomLeftRadius: RADIUS,
           color: theme.text,
           overflow: "hidden",
-          // borderRadius: 10,        // optional; remove if you want a perfectly flush column
           display: "grid",
-          gridTemplateColumns: asideOpen ? `${RAIL_W}px 1fr` : `${RAIL_W}px`, // rail + panel'
+          gridTemplateColumns: asideOpen ? `${RAIL_W}px 1fr` : `${RAIL_W}px`,
         }}
       >
-        {/* -------- Icon Rail (fixed width, always visible, same position) -------- */}
+        {/* Rail */}
         <div
+          role="toolbar"
+          aria-label="Aside tools"
           style={{
             width: "100%",
-            // borderRight: `1px solid ${theme.border}`,
             borderRight: `${RAIL_BORDER}px solid ${theme.border}`,
             display: "flex",
             flexDirection: "column",
@@ -184,19 +183,16 @@ export default function App() {
             boxSizing: "border-box",
             background: theme.surface,
           }}
-          role="toolbar"
-          aria-label="Aside tools"
         >
           {railItems.map((item) => {
             const active = asideOpen && asideMode === item.mode;
-            const expanded = active ? true : false;
             return (
               <button
                 key={item.mode}
                 onClick={() => onRailClick(item.mode)}
                 title={item.label}
                 aria-label={item.label}
-                aria-expanded={expanded}
+                aria-expanded={active}
                 style={{
                   width: BTN_SIZE,
                   height: BTN_SIZE,
@@ -205,13 +201,11 @@ export default function App() {
                   background: active ? theme.accent : theme.cardBg,
                   color: "#fff",
                   cursor: "pointer",
-                  // 👇 center the emoji perfectly
                   display: "grid",
                   placeItems: "center",
                   padding: 0,
                   lineHeight: 1,
                   textAlign: "center",
-                  // optional: make emoji size consistent
                   fontSize: 20,
                 }}
               >
@@ -220,7 +214,8 @@ export default function App() {
             );
           })}
         </div>
-        {/* -------- Panel (only rendered when expanded) -------- */}
+
+        {/* Panel */}
         {asideOpen && (
           <div
             id="aside-panel"
@@ -237,7 +232,6 @@ export default function App() {
               overflow: "hidden",
             }}
           >
-            {/* Panel header (shows active section title) */}
             <div
               style={{
                 display: "flex",
@@ -249,18 +243,13 @@ export default function App() {
             >
               <h2 style={{ margin: 0, fontSize: 16, flex: 1 }}>
                 {asideMode === "about" ? (
-                  <div style={{ color: theme.muted }}>
-                    <p>About / instructions…</p>
-                  </div>
+                  <div style={{ color: theme.muted }}><p>About / instructions…</p></div>
                 ) : (
-                  <div style={{ color: theme.muted }}>
-                    <p>Settings go here…</p>
-                  </div>
+                  <div style={{ color: theme.muted }}><p>Settings go here…</p></div>
                 )}
               </h2>
             </div>
 
-            {/* Panel body (scrollable) — placeholder for now */}
             <div
               style={{
                 overflow: "auto",
@@ -271,12 +260,10 @@ export default function App() {
             >
               {asideMode === "about" ? (
                 <>
-                  <p>
-                    This panel will show instructions and app info. Use the icon rail to switch modes.
-                  </p>
+                  <p>Use the icon rail to switch modes.</p>
                   <ul style={{ marginTop: 8 }}>
-                    <li>🛈 About — read instructions and app details.</li>
-                    <li>🖼️ Preview — view the selected image with EXIF (coming soon).</li>
+                    <li>🛈 About — app info.</li>
+                    <li>⚙️ Settings — config (coming soon).</li>
                   </ul>
                 </>
               ) : (
@@ -289,8 +276,5 @@ export default function App() {
     </div>
   );
 }
-
-
-
 
 
