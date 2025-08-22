@@ -2,16 +2,18 @@ import { useEffect, useMemo, useState } from "react";
 import type { StagingEntry } from "../types";
 import Thumb from "./Thumb";
 
+/* ----------------------------------------------------------------------------
+   Types & helpers
+---------------------------------------------------------------------------- */
 
-// EXIF types (adjust as your API grows)
+// EXIF value shape (adjust as your API grows)
 type ExifValue = string | number | boolean | null | undefined;
 type ExifData = Record<string, ExifValue>;
 
-// Safe error stringify (lets us use `unknown` in catch)
+// Safe error stringify so we can use `unknown` in catch blocks
 function toErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
-
 
 // Theme passed from App for consistent dark styling
 type Theme = {
@@ -38,10 +40,6 @@ type StagingStats = {
   total_files: number;
 };
 
-/* ===========================
-   Helpers for the preview
-   =========================== */
-
 // Detect videos by extension; keep in sync with backend TOML [ext.video]
 function looksLikeVideo(name: string): boolean {
   const ext = (name.split(".").pop() || "").toLowerCase();
@@ -62,22 +60,37 @@ function withHeight(url: string, h: number): string {
   }
 }
 
+// Discriminated union for preview source (helps TS avoid implicit anys)
+type MediaSrc =
+  | { kind: "image"; url: string }
+  | { kind: "video"; url: string }
+  | null;
+
+/* ----------------------------------------------------------------------------
+   Component
+---------------------------------------------------------------------------- */
+
 export default function StagingView({ theme }: { theme: Theme }) {
+  // Routing state (source root + path inside it)
   const [roots, setRoots] = useState<RootName[]>([]);
   const [root, setRoot] = useState<RootName | "">("");
   const [path, setPath] = useState<string>("");
 
+  // Data + selection for the grid
   const [entries, setEntries] = useState<StagingEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
-
-  // NEW: selected file for the preview panel
   const [selected, setSelected] = useState<StagingEntry | null>(null);
 
-  // stats for the toolbar counters
+  // Stats for toolbar pills
   const [stats, setStats] = useState<StagingStats | null>(null);
   const [statsError, setStatsError] = useState<string | null>(null);
 
-  // Load roots on mount
+  // EXIF state: table is always visible; "expanded" shows all fields
+  const [exifExpanded, setExifExpanded] = useState(false);
+  const [exifData, setExifData] = useState<ExifData | null>(null);
+  const [exifErr, setExifErr] = useState<string | null>(null);
+
+  // Load available staging roots on mount
   useEffect(() => {
     fetch(`${API_BASE}/api/staging/roots`)
       .then((r) => r.json())
@@ -88,7 +101,7 @@ export default function StagingView({ theme }: { theme: Theme }) {
       .catch((e) => setError(`failed to load roots: ${String(e)}`));
   }, []);
 
-  // Load entries whenever root/path changes (previewable files only)
+  // Load entries whenever root/path changes
   useEffect(() => {
     if (!root) return;
     const params = new URLSearchParams();
@@ -103,7 +116,8 @@ export default function StagingView({ theme }: { theme: Theme }) {
       .then((list: StagingEntry[]) => {
         setEntries(list);
         setError(null);
-        setSelected(null); // clear preview when navigating
+        setSelected(null);       // clear preview when navigating
+        setExifExpanded(false);  // collapse EXIF on folder change
       })
       .catch((e) => setError(`failed to list: ${String(e)}`));
   }, [root, path]);
@@ -127,69 +141,22 @@ export default function StagingView({ theme }: { theme: Theme }) {
       .catch((e) => setStatsError(`failed to load stats: ${String(e)}`));
   }, [root, path]);
 
-  // Breadcrumbs
-  const crumbs = useMemo(() => {
-    const parts = path ? path.split("/").filter(Boolean) : [];
-    const acc: { name: string; p: string }[] = [];
-    let cur = "";
-    for (const seg of parts) {
-      cur = cur ? `${cur}/${seg}` : seg;
-      acc.push({ name: seg, p: cur });
-    }
-    return acc;
-  }, [path]);
-
-  function goUp() {
-    if (!path) return;
-    const idx = path.lastIndexOf("/");
-    setPath(idx >= 0 ? path.slice(0, idx) : "");
-  }
-
-  function openDir(entry: StagingEntry) {
-    if (!entry.is_dir) return;
-    setPath(entry.rel_path);
-  }
-
-  /* ===========================
-     Preview URL (image/video)
-     =========================== */
-  const previewSrc = useMemo(() => {
-    if (!selected || selected.is_dir) return null;
-
-    // Videos → use original file URL
-    if (looksLikeVideo(selected.name)) {
-      return { kind: "video" as const, url: selected.media_url ?? "" };
-    }
-
-    // Images (incl. HEIC) → ask thumb endpoint for a taller JPEG
-    if (selected.thumb_url) {
-      return { kind: "image" as const, url: withHeight(selected.thumb_url, 1200) };
-    }
-
-    // Fallback, if no thumb generated
-    if (selected.media_url) {
-      return { kind: "image" as const, url: selected.media_url };
-    }
-    return null;
-  }, [selected]);
-
-  // Simple collapsible EXIF state
-  const [exifOpen, setExifOpen] = useState(false);
-  const [exifData, setExifData] = useState<ExifData | null>(null);
-  const [exifErr, setExifErr] = useState<string | null>(null);
-
+  // EXIF: always load basic fields for the selected file (panel is always visible)
   useEffect(() => {
     let cancelled = false;
 
-    if (!exifOpen || !selected || selected.is_dir) {
+    if (!selected || selected.is_dir) {
       setExifData(null);
       setExifErr(null);
-      return () => { cancelled = true; };
+      return () => {
+        cancelled = true;
+      };
     }
 
     (async () => {
       try {
         // TODO: replace with real API call (e.g., /api/staging/exif?root=&path=)
+        // Provide a few useful basics so collapsed view has content.
         const d: ExifData = {
           Filename: selected.name,
           Modified: selected.mtime ?? "",
@@ -202,9 +169,51 @@ export default function StagingView({ theme }: { theme: Theme }) {
       }
     })();
 
-  return () => { cancelled = true; };
-}, [exifOpen, selected]);
+    return () => {
+      cancelled = true;
+    };
+  }, [selected]);
 
+  // Breadcrumbs from current path
+  const crumbs = useMemo(() => {
+    const parts = path ? path.split("/").filter(Boolean) : [];
+    const acc: { name: string; p: string }[] = [];
+    let cur = "";
+    for (const seg of parts) {
+      cur = cur ? `${cur}/${seg}` : seg;
+      acc.push({ name: seg, p: cur });
+    }
+    return acc;
+  }, [path]);
+
+  // Navigation helpers
+  function goUp() {
+    if (!path) return;
+    const idx = path.lastIndexOf("/");
+    setPath(idx >= 0 ? path.slice(0, idx) : "");
+  }
+  function openDir(entry: StagingEntry) {
+    if (!entry.is_dir) return;
+    setPath(entry.rel_path);
+  }
+
+  // Compute a preview URL for the right pane (image or video)
+  const previewSrc = useMemo<MediaSrc>(() => {
+    if (!selected || selected.is_dir) return null;
+
+    if (looksLikeVideo(selected.name)) {
+      return { kind: "video", url: selected.media_url ?? "" };
+    }
+    if (selected.thumb_url) {
+      return { kind: "image", url: withHeight(selected.thumb_url, 1200) };
+    }
+    if (selected.media_url) {
+      return { kind: "image", url: selected.media_url };
+    }
+    return null;
+  }, [selected]);
+
+  /* ------------------------------------------------------------------------ */
 
   return (
     <section
@@ -251,9 +260,13 @@ export default function StagingView({ theme }: { theme: Theme }) {
                 padding: "6px 8px",
               }}
             >
-              <option value="" disabled>select…</option>
+              <option value="" disabled>
+                select…
+              </option>
               {roots.map((r) => (
-                <option key={r} value={r}>{r}</option>
+                <option key={r} value={r}>
+                  {r}
+                </option>
               ))}
             </select>
           </label>
@@ -320,7 +333,7 @@ export default function StagingView({ theme }: { theme: Theme }) {
             { icon: "📷", label: "Images", val: stats?.images },
             { icon: "🎞️", label: "Videos", val: stats?.videos },
             { icon: "📁", label: "Folders", val: stats?.dirs },
-            { icon: "🧩", label: "Other",  val: stats?.other },
+            { icon: "🧩", label: "Other", val: stats?.other },
           ].map((p) => (
             <div
               key={p.label}
@@ -373,9 +386,7 @@ export default function StagingView({ theme }: { theme: Theme }) {
             minHeight: 0,
           }}
         >
-          {error && (
-            <div style={{ gridColumn: "1 / -1", color: "#fca5a5" }}>{error}</div>
-          )}
+          {error && <div style={{ gridColumn: "1 / -1", color: "#fca5a5" }}>{error}</div>}
 
           {!error && entries.length === 0 && (
             <div
@@ -390,7 +401,9 @@ export default function StagingView({ theme }: { theme: Theme }) {
             >
               <div>
                 <div style={{ fontSize: 28, marginBottom: 6 }}>🗂️</div>
-                <div>No items here. <strong>Select a folder</strong> to view files.</div>
+                <div>
+                  No items here. <strong>Select a folder</strong> to view files.
+                </div>
               </div>
             </div>
           )}
@@ -441,12 +454,7 @@ export default function StagingView({ theme }: { theme: Theme }) {
                     📁
                   </div>
                 ) : e.media_url ? (
-                  <Thumb
-                    src={(e.thumb_url ?? e.media_url)!}
-                    alt={e.name}
-                    height={140}
-                    fit="cover"
-                  />
+                  <Thumb src={(e.thumb_url ?? e.media_url)!} alt={e.name} height={140} fit="cover" />
                 ) : (
                   <div
                     style={{
@@ -525,19 +533,15 @@ export default function StagingView({ theme }: { theme: Theme }) {
                 style={{ maxHeight: "75vh", maxWidth: "100%", objectFit: "contain" }}
               />
             ) : (
-              <video
-                src={previewSrc.url}
-                controls
-                style={{ maxHeight: "75vh", maxWidth: "100%" }}
-              />
+              <video src={previewSrc.url} controls style={{ maxHeight: "75vh", maxWidth: "100%" }} />
             )}
           </div>
 
-          {/* footer actions */}
+          {/* footer actions — EXIF on left, Remove on right */}
           <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center" }}>
             <button
+              onClick={() => setExifExpanded((v) => !v)}
               disabled={!selected || selected.is_dir}
-              onClick={() => selected && !selected.is_dir && alert(`Remove: ${selected.name}`)}
               style={{
                 padding: "6px 10px",
                 borderRadius: 8,
@@ -547,63 +551,101 @@ export default function StagingView({ theme }: { theme: Theme }) {
                 cursor: !selected || selected.is_dir ? "not-allowed" : "pointer",
                 opacity: !selected || selected.is_dir ? 0.5 : 1,
               }}
-              title="Remove from Staging"
+              title={exifExpanded ? "Hide additional EXIF fields" : "Show all EXIF fields"}
             >
-              Remove from Staging
+              {exifExpanded ? "Hide EXIF" : "Show EXIF"}
             </button>
 
-            <div style={{ marginLeft: "auto" }}>
-              <button
-                onClick={() => setExifOpen((o) => !o)}
-                disabled={!selected || selected.is_dir}
-                style={{
-                  padding: "6px 10px",
-                  borderRadius: 8,
-                  border: `1px solid ${theme.border}`,
-                  background: theme.cardBg,
-                  color: theme.text,
-                  cursor: !selected || selected.is_dir ? "not-allowed" : "pointer",
-                  opacity: !selected || selected.is_dir ? 0.5 : 1,
-                }}
-              >
-                {exifOpen ? "Hide" : "Show"} EXIF
-              </button>
-            </div>
+            <div style={{ marginLeft: "auto" }} />
+
+            {/* Dangerous action: red visuals to indicate deletion/removal */}
+            <button
+              disabled={!selected || selected.is_dir}
+              onClick={() => selected && !selected.is_dir && alert(`Remove: ${selected.name}`)}
+              style={{
+                padding: "6px 10px",
+                borderRadius: 8,
+                border: "1px solid #7f1d1d", // dark red border
+                background: "#2a0b0b",       // subtle red-tinted bg
+                color: "#ef4444",            // red text
+                cursor: !selected || selected.is_dir ? "not-allowed" : "pointer",
+                opacity: !selected || selected.is_dir ? 0.5 : 1,
+              }}
+              title="Delete from Staging (cannot be undone)"
+              aria-label="Delete from Staging"
+            >
+              🗑️ Delete
+            </button>
           </div>
 
-          {/* collapsible EXIF */}
-          {exifOpen && (
-            <div
-              style={{
-                marginTop: 10,
-                borderTop: `1px solid ${theme.border}`,
-                paddingTop: 10,
-                fontSize: 12,
-                color: theme.text,
-                maxHeight: 240,
-                overflow: "auto",
-              }}
-            >
-              {!selected ? (
-                <div style={{ color: theme.muted }}>Select a file</div>
-              ) : exifErr ? (
-                <div style={{ color: "#fca5a5" }}>Failed to load EXIF: {exifErr}</div>
-              ) : exifData ? (
-                <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                  <tbody>
-                    {Object.entries(exifData).map(([k, v]) => (
-                      <tr key={k} style={{ borderBottom: `1px solid ${theme.border}` }}>
-                        <td style={{ padding: "6px 8px", color: theme.muted, whiteSpace: "nowrap", verticalAlign: "top" }}>{k}</td>
-                        <td style={{ padding: "6px 8px", wordBreak: "break-word" }}>{String(v ?? "")}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              ) : (
-                <div style={{ color: theme.muted }}>Loading…</div>
-              )}
-            </div>
-          )}
+          {/* EXIF is always rendered: show a few key fields; expand to show all */}
+          <div
+            style={{
+              marginTop: 10,
+              borderTop: `1px solid ${theme.border}`,
+              paddingTop: 10,
+              fontSize: 12,
+              color: theme.text,
+              maxHeight: exifExpanded ? 320 : 200,
+              overflow: "auto",
+            }}
+          >
+            {!selected || selected.is_dir ? (
+              <div style={{ color: theme.muted }}>Select a file to view EXIF</div>
+            ) : exifErr ? (
+              <div style={{ color: "#fca5a5" }}>Failed to load EXIF: {exifErr}</div>
+            ) : !exifData ? (
+              <div style={{ color: theme.muted }}>Loading…</div>
+            ) : (
+              (() => {
+                // Show a small “primary” subset when collapsed; everything when expanded.
+                const entries = Object.entries(exifData) as Array<[string, ExifValue]>;
+                const primaryKeys = new Set([
+                  "Filename",
+                  "TakenAt",
+                  "Modified",
+                  "Size",
+                  "Path",
+                  "GPSLat",
+                  "GPSLon",
+                  "Make",
+                  "Model",
+                ]);
+                const primary = entries.filter(([k]) => primaryKeys.has(k));
+                const visible = exifExpanded ? entries : primary.length ? primary : entries.slice(0, 8);
+                const hiddenCount = exifExpanded ? 0 : Math.max(entries.length - visible.length, 0);
+
+                return (
+                  <>
+                    <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                      <tbody>
+                        {visible.map(([k, v]) => (
+                          <tr key={k} style={{ borderBottom: `1px solid ${theme.border}` }}>
+                            <td
+                              style={{
+                                padding: "6px 8px",
+                                color: theme.muted,
+                                whiteSpace: "nowrap",
+                                verticalAlign: "top",
+                              }}
+                            >
+                              {k}
+                            </td>
+                            <td style={{ padding: "6px 8px", wordBreak: "break-word" }}>{String(v ?? "")}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {!exifExpanded && hiddenCount > 0 && (
+                      <div style={{ marginTop: 6, color: theme.muted }}>
+                        {hiddenCount} more field{hiddenCount === 1 ? "" : "s"} hidden. Click “Show EXIF” to expand.
+                      </div>
+                    )}
+                  </>
+                );
+              })()
+            )}
+          </div>
         </div>
       </div>
     </section>
