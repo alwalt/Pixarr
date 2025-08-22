@@ -18,12 +18,25 @@ type Theme = {
 const API_BASE = "http://localhost:8000";
 type RootName = string;
 
+type StagingStats = {
+  images: number;
+  videos: number;
+  raw: number;
+  other: number;
+  dirs: number;
+  total_files: number;
+};
+
 export default function StagingView({ theme }: { theme: Theme }) {
   const [roots, setRoots] = useState<RootName[]>([]);
   const [root, setRoot] = useState<RootName | "">("");
   const [path, setPath] = useState<string>("");
   const [entries, setEntries] = useState<StagingEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
+
+  // NEW: stats state for the right-side counter
+  const [stats, setStats] = useState<StagingStats | null>(null);
+  const [statsError, setStatsError] = useState<string | null>(null);
 
   // Load roots on mount
   useEffect(() => {
@@ -36,7 +49,7 @@ export default function StagingView({ theme }: { theme: Theme }) {
       .catch((e) => setError(`failed to load roots: ${String(e)}`));
   }, []);
 
-  // Load entries whenever root/path changes
+  // Load entries whenever root/path changes (previewable files only)
   useEffect(() => {
     if (!root) return;
     const params = new URLSearchParams();
@@ -53,6 +66,25 @@ export default function StagingView({ theme }: { theme: Theme }) {
         setError(null);
       })
       .catch((e) => setError(`failed to list: ${String(e)}`));
+  }, [root, path]);
+
+  // NEW: fetch stats (images/videos/raw/other/dirs/total) for current folder
+  useEffect(() => {
+    if (!root) return;
+    const params = new URLSearchParams();
+    params.set("root", root);
+    if (path) params.set("path", path);
+
+    fetch(`${API_BASE}/api/staging/stats?${params.toString()}`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((s: StagingStats) => {
+        setStats(s);
+        setStatsError(null);
+      })
+      .catch((e) => setStatsError(`failed to load stats: ${String(e)}`));
   }, [root, path]);
 
   // Build breadcrumb parts from current path
@@ -87,11 +119,13 @@ export default function StagingView({ theme }: { theme: Theme }) {
         display: "grid",
         gridTemplateRows: "auto 1fr", // Row 1 toolbar, Row 2 content
         gap: 12,
-        minHeight: 0, // allow the 1fr row to shrink/scroll
+        minHeight: 0,
         minWidth: 0,
         overflow: "hidden",
-        paddingBottom: 8, // small breathing room at bottom
+        height: "100%",
+        paddingBottom: 8,
         paddingLeft: 5,
+        color: theme.text,
       }}
     >
       {/* Row 1: toolbar */}
@@ -99,90 +133,195 @@ export default function StagingView({ theme }: { theme: Theme }) {
         style={{
           display: "flex",
           alignItems: "center",
-          gap: 8,
+          gap: 0,
           flexWrap: "wrap",
           color: theme.text,
+          transform: "translateY(8px)",
+          width: "100%",
         }}
       >
-        <label>
-          root:&nbsp;
-          <select
-            value={root}
-            onChange={(e) => {
-              setRoot(e.target.value);
-              setPath("");
-            }}
+        {/* Left-side controls */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <label>
+            source:&nbsp;
+            <select
+              value={root}
+              onChange={(e) => {
+                setRoot(e.target.value);
+                setPath("");
+              }}
+              style={{
+                background: theme.surface,
+                color: theme.text,
+                border: `1px solid ${theme.border}`,
+                borderRadius: 8,
+                padding: "6px 8px",
+              }}
+            >
+              <option value="" disabled>
+                select…
+              </option>
+              {roots.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <div style={{ color: theme.muted }}>
+            path:&nbsp;
+            <button
+              onClick={() => setPath("")}
+              style={{
+                border: "none",
+                background: "transparent",
+                textDecoration: "underline",
+                cursor: "pointer",
+                padding: 0,
+                color: theme.text,
+              }}
+              title="go to root"
+            >
+              /
+            </button>
+            {crumbs.map((c) => (
+              <span key={c.p}>
+                <span>&nbsp;/&nbsp;</span>
+                <button
+                  onClick={() => setPath(c.p)}
+                  style={{
+                    border: "none",
+                    background: "transparent",
+                    textDecoration: "underline",
+                    cursor: "pointer",
+                    padding: 0,
+                    color: theme.text,
+                  }}
+                  title={`go to ${c.p}`}
+                >
+                  {c.name}
+                </button>
+              </span>
+            ))}
+          </div>
+
+          <button
+            onClick={goUp}
+            disabled={!path}
             style={{
+              padding: "6px 10px",
+              borderRadius: 8,
+              border: `1px solid ${theme.border}`,
               background: theme.surface,
               color: theme.text,
-              border: `1px solid ${theme.border}`,
-              borderRadius: 8,
-              padding: "6px 8px",
+              cursor: path ? "pointer" : "not-allowed",
+              opacity: path ? 1 : 0.5,
             }}
           >
-            <option value="" disabled>
-              select…
-            </option>
-            {roots.map((r) => (
-              <option key={r} value={r}>
-                {r}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <div style={{ color: theme.muted }}>
-          path:&nbsp;
-          <button
-            onClick={() => setPath("")}
-            style={{
-              border: "none",
-              background: "transparent",
-              textDecoration: "underline",
-              cursor: "pointer",
-              padding: 0,
-              color: theme.text,
-            }}
-            title="go to root"
-          >
-            /
+            ↑ up
           </button>
-          {crumbs.map((c) => (
-            <span key={c.p}>
-              <span>&nbsp;/&nbsp;</span>
-              <button
-                onClick={() => setPath(c.p)}
-                style={{
-                  border: "none",
-                  background: "transparent",
-                  textDecoration: "underline",
-                  cursor: "pointer",
-                  padding: 0,
-                  color: theme.text,
-                }}
-                title={`go to ${c.p}`}
-              >
-                {c.name}
-              </button>
-            </span>
-          ))}
         </div>
 
-        <button
-          onClick={goUp}
-          disabled={!path}
+        {/* Right-side: COUNTERS (from backend stats) */}
+        <div
           style={{
-            padding: "6px 10px",
-            borderRadius: 8,
-            border: `1px solid ${theme.border}`,
-            background: theme.surface,
-            color: theme.text,
-            cursor: path ? "pointer" : "not-allowed",
-            opacity: path ? 1 : 0.5,
+            marginLeft: "auto",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
           }}
         >
-          ↑ up
-        </button>
+          {/* Show a subtle error if stats failed */}
+          {statsError && (
+            <span style={{ color: "#fca5a5", fontSize: 12 }}>{statsError}</span>
+          )}
+
+          {/* Always render pills; if stats are null yet, show “–” */}
+          <div
+            title="Images"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+              padding: "4px 8px",
+              borderRadius: 999,
+              border: `1px solid ${theme.border}`,
+              background: theme.surface,
+              color: theme.text,
+              fontSize: 12,
+              lineHeight: 1,
+            }}
+          >
+            <span aria-hidden>📷</span>
+            <strong style={{ fontWeight: 600 }}>Images</strong>
+            <span style={{ color: theme.muted }}>·</span>
+            <span>{stats ? stats.images : "–"}</span>
+          </div>
+
+          <div
+            title="Videos"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+              padding: "4px 8px",
+              borderRadius: 999,
+              border: `1px solid ${theme.border}`,
+              background: theme.surface,
+              color: theme.text,
+              fontSize: 12,
+              lineHeight: 1,
+            }}
+          >
+            <span aria-hidden>🎞️</span>
+            <strong style={{ fontWeight: 600 }}>Videos</strong>
+            <span style={{ color: theme.muted }}>·</span>
+            <span>{stats ? stats.videos : "–"}</span>
+          </div>
+
+          <div
+            title="Subfolders in current directory"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+              padding: "4px 8px",
+              borderRadius: 999,
+              border: `1px solid ${theme.border}`,
+              background: theme.surface,
+              color: theme.text,
+              fontSize: 12,
+              lineHeight: 1,
+            }}
+          >
+            <span aria-hidden>📁</span>
+            <strong style={{ fontWeight: 600 }}>Folders</strong>
+            <span style={{ color: theme.muted }}>·</span>
+            <span>{stats ? stats.dirs : "–"}</span>
+          </div>
+
+          <div
+            title="Other (junk / unknown)"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+              padding: "4px 8px",
+              borderRadius: 999,
+              border: `1px solid ${theme.border}`,
+              background: theme.surface,
+              color: theme.text,
+              fontSize: 12,
+              lineHeight: 1,
+            }}
+          >
+            <span aria-hidden>🧩</span>
+            <strong style={{ fontWeight: 600 }}>Other</strong>
+            <span style={{ color: theme.muted }}>·</span>
+            <span>{stats ? stats.other : "–"}</span>
+          </div>
+        </div>
       </div>
 
       {/* Row 2: scrollable items grid */}
@@ -191,15 +330,15 @@ export default function StagingView({ theme }: { theme: Theme }) {
           display: "grid",
           gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
           gap: 10,
-          height: "100%",      // fills the remaining height
+          height: "100%",
           width: "100%",
-          overflowY: "auto",   // internal scroll
+          overflowY: "auto",
           border: `1px solid ${theme.border}`,
           borderRadius: 10,
           padding: 10,
           boxSizing: "border-box",
           background: theme.surface,
-          minHeight: 0,        // critical for nested grid scrolling
+          minHeight: 0,
         }}
       >
         {error && (
@@ -208,9 +347,30 @@ export default function StagingView({ theme }: { theme: Theme }) {
           </div>
         )}
 
+        {/* EMPTY STATE */}
+        {!error && entries.length === 0 && (
+          <div
+            style={{
+              gridColumn: "1 / -1",
+              display: "grid",
+              placeItems: "center",
+              height: "100%",
+              color: theme.muted,
+              textAlign: "center",
+            }}
+          >
+            <div>
+              <div style={{ fontSize: 28, marginBottom: 6 }}>🗂️</div>
+              <div>
+                No items here. <strong>Select a folder</strong> to view files.
+              </div>
+            </div>
+          </div>
+        )}
+
         {entries.map((e) => {
           const isDir = e.is_dir;
-          const click = () => (isDir ? openDir(e) : undefined); // files are no-op for now
+          const click = () => (isDir ? openDir(e) : undefined);
           return (
             <button
               key={e.rel_path || e.name}
@@ -246,12 +406,7 @@ export default function StagingView({ theme }: { theme: Theme }) {
                   📁
                 </div>
               ) : e.media_url ? (
-                <Preview
-                  src={(e.thumb_url ?? e.media_url)!}
-                  alt={e.name}
-                  height={140}
-                  fit="cover"
-                />
+                <Preview src={(e.thumb_url ?? e.media_url)!} alt={e.name} height={140} fit="cover" />
               ) : (
                 <div
                   style={{

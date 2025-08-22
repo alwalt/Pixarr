@@ -1,32 +1,16 @@
-# Pixarr configuration template
-# Copy this file to: pixarr.toml
-# CLI flags always override values here.
-
 [paths]
-# Root folder where Pixarr stores the DB and media tree.
-# If omitted, defaults to "<repo>/data".
-# Example:
-# data_dir = "/Volumes/Data/Pixarr/data"
+data_dir = "/Volumes/Data/Pixarr/data"
+db_path = "db/app.sqlite3"
+review_subdir = "media/Review"
+staging_subdir = "media/Staging"
+thumb_subdir   = "thumb-cache"
 
 [ingest]
-# Start in dry-run mode unless --write is passed.
-dry_run_default = true
-# What to do when a file with the same hash already exists in Review/
-#   ignore     -> mark verified, leave staging file alone
-#   quarantine -> move staging file to Quarantine/duplicate_in_review (requires [quarantine].dupes=true)
-#   delete     -> delete staging file (falls back to quarantine:move_failed if delete fails)
-on_review_dupe = "quarantine"  # or "ignore" or "delete"
-
-
-# Capture-time resolution policy:
-# 1) EXIF/QuickTime (always tried first)
-# 2) Filename-derived (only if allow_filename_dates = true)
-# 3) File dates (ModifyDate/FileModifyDate) (only if allow_file_dates = true)
 allow_filename_dates = false
-allow_file_dates = false
+allow_file_dates = false     # if you ever want ModifyDate/FileModifyDate
+dry_run_default = true
 
 [quarantine]
-# Enable/disable quarantine buckets.
 missing_datetime = true
 junk = true
 unsupported_ext = true
@@ -34,3 +18,18 @@ zero_bytes = true
 stat_error = true
 move_failed = true
 dupes = true
+
+[staging.roots]
+pc     = "pc"
+icloud = "icloud"
+sdcard = "sdcard"
+other  = "other"
+
+[ext]
+# Used by /api/staging/list to decide which files to show
+supported = ["jpg","jpeg","png","gif","webp","heic","heif","mp4","mov","webm","mkv","avi"]
+
+# Used by /api/staging/stats to bucket files
+image = ["jpg","jpeg","png","tif","tiff","gif","webp","heic","heif","avif"]
+video = ["mp4","mov","m4v","avi","webm","mkv"]
+raw   = ["dng","cr2","cr3","nef","arw","raf","rw2","orf","srw"]
