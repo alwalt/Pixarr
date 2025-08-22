@@ -211,32 +211,62 @@ export default function StagingView({ theme }: { theme: Theme }) {
     >
       {/* toolbar */}
       <div style={{ display: "flex", alignItems: "center", gap: 0, flexWrap: "wrap", color: theme.text, transform: "translateY(8px)", width: "100%" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", paddingBottom: 4,}}>
           <label>
-            source:&nbsp;
+            Source:&nbsp;
             <select
               value={root}
               onChange={(e) => { setRoot(e.target.value); setPath(""); }}
-              style={{ background: theme.surface, color: theme.text, border: `1px solid ${theme.border}`, borderRadius: 8, padding: "6px 8px" }}
+              style={{ background: theme.surface, color: theme.text, border: `1px solid ${theme.border}`, borderRadius: 8, padding: "7px 5px" }}
             >
               <option value="" disabled>select…</option>
               {roots.map((r) => <option key={r} value={r}>{r}</option>)}
             </select>
           </label>
+            {/* NEW ACTION BUTTONS */}
+              <button
+                onClick={() => alert("sync triggered")}
+                style={{
+                  padding: "4px 8px",
+                  borderRadius: 8,
+                  border: `1px solid ${theme.border}`,
+                  background: theme.surface,
+                  color: theme.text,
+                  cursor: "pointer",
+                }}
+                title="Sync staging folders (e.g. icloudpd, sdcard, etc)"
+              >
+                🔄 Sync
+              </button>
+
+              <button
+                onClick={() => alert("move to review triggered")}
+                style={{
+                  padding: "4px 8px",
+                  borderRadius: 8,
+                  border: `1px solid ${theme.border}`,
+                  background: theme.surface,
+                  color: theme.text,
+                  cursor: "pointer",
+                }}
+                title="Run ingest to move files into Review and update DB"
+              >
+                📤 Move to Review
+              </button>
 
           <div style={{ color: theme.muted }}>
-            path:&nbsp;
-            <button onClick={() => setPath("")} style={{ border: "none", background: "transparent", textDecoration: "underline", cursor: "pointer", padding: 0, color: theme.text }} title="go to root">/</button>
+            Path:&nbsp;
+            <button onClick={() => setPath("")} style={{ padding: "4px 5px", border: "none", background: "transparent", textDecoration: "underline", cursor: "pointer", color: theme.text }} title="go to root">/</button>
             {crumbs.map((c) => (
               <span key={c.p}>
                 <span>&nbsp;/&nbsp;</span>
-                <button onClick={() => setPath(c.p)} style={{ border: "none", background: "transparent", textDecoration: "underline", cursor: "pointer", padding: 0, color: theme.text }} title={`go to ${c.p}`}>{c.name}</button>
+                <button onClick={() => setPath(c.p)} style={{ padding: "4px 5px", border: "none", background: "transparent", textDecoration: "underline", cursor: "pointer", color: theme.text }} title={`go to ${c.p}`}>{c.name}</button>
               </span>
             ))}
           </div>
 
-          <button onClick={goUp} disabled={!path} style={{ padding: "6px 10px", borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, cursor: path ? "pointer" : "not-allowed", opacity: path ? 1 : 0.5 }}>
-            ↑ up
+          <button onClick={goUp} disabled={!path} style={{ padding: "4px 5px", borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, cursor: path ? "pointer" : "not-allowed", opacity: path ? 1 : 0.5 }}>
+            ↑
           </button>
         </div>
 

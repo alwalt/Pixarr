@@ -114,7 +114,7 @@ export default function App() {
           borderBottomRightRadius: RADIUS,
         }}
       >
-        <h1 style={{ margin: "0 0 4px 0", color: theme.text, textAlign: "left" }}>pixarr</h1>
+        <h1 style={{ margin: "0 0 4px 0", color: theme.text, textAlign: "left" }}>Pixarr</h1>
         <p className="muted" style={{ margin: 0, color: theme.muted , textAlign: "left"}}>
           automatic importer for personal photos and videos: watch sources, normalize metadata,
           dedupe, and organize.
