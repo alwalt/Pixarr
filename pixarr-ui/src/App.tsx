@@ -123,7 +123,7 @@ export default function App() {
       >
         <h1 style={{ margin: "0 0 4px 0", color: theme.text }}>pixarr</h1>
         <p className="muted" style={{ margin: 0, color: theme.muted }}>
-          staging & review browser. thumbnails for fast scroll; full preview on select.
+          automatic importer for personal photos and videos: watch sources, normalize metadata, dedupe, and organize.
         </p>
 
         <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
