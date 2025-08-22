@@ -24,7 +24,7 @@ const RAIL_EXTRA = 2; // small breathing room so it never feels cramped
 const RAIL_W = BTN_SIZE + RAIL_PAD * 2 + RAIL_BORDER + RAIL_EXTRA;
 
 type Tab = "staging" | "review";
-type AsideMode = "about" | "preview"; // extend later as you add more functions
+type AsideMode = "about" | "settings"; // extend later as you add more functions
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("staging");
@@ -63,10 +63,11 @@ export default function App() {
   };
 
   // Icon rail items — using emoji (“🛈”) style
-  const railItems: Array<{ mode: AsideMode; icon: string; label: string }> = [
-    { mode: "about", icon: "🛈", label: "About / Instructions" },
-    { mode: "preview", icon: "🖼️", label: "Preview" },
-  ];
+  const railItems = [
+  { mode: "about" as const,    icon: "🛈", label: "About / Instructions" },
+  { mode: "settings" as const, icon: "⚙️", label: "Settings" },
+];
+
 
   // const toggleAside = () => setAsideOpen((v) => !v);
   // Clicking an icon:
@@ -247,7 +248,15 @@ export default function App() {
               }}
             >
               <h2 style={{ margin: 0, fontSize: 16, flex: 1 }}>
-                {asideMode === "about" ? "About / Instructions" : "Preview"}
+                {asideMode === "about" ? (
+                  <div style={{ color: theme.muted }}>
+                    <p>About / instructions…</p>
+                  </div>
+                ) : (
+                  <div style={{ color: theme.muted }}>
+                    <p>Settings go here…</p>
+                  </div>
+                )}
               </h2>
             </div>
 
@@ -271,7 +280,7 @@ export default function App() {
                   </ul>
                 </>
               ) : (
-                <>Preview goes here (image + EXIF, coming soon).</>
+                <>Settings goes here (toml, coming soon).</>
               )}
             </div>
           </div>

@@ -2,51 +2,27 @@ import { useEffect, useMemo, useState } from "react";
 import type { StagingEntry } from "../types";
 import Thumb from "./Thumb";
 
-/* ----------------------------------------------------------------------------
-   Types & helpers
----------------------------------------------------------------------------- */
-
-// EXIF value shape (adjust as your API grows)
-type ExifValue = string | number | boolean | null | undefined;
-type ExifData = Record<string, ExifValue>;
-
-// Safe error stringify so we can use `unknown` in catch blocks
-function toErrorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-// Theme passed from App for consistent dark styling
+// Types
 type Theme = {
-  appBg: string;
-  headerBg: string;
-  surface: string;
-  cardBg: string;
-  border: string;
-  text: string;
-  muted: string;
-  accent: string;
-  accentBorder: string;
+  appBg: string; headerBg: string; surface: string; cardBg: string;
+  border: string; text: string; muted: string; accent: string; accentBorder: string;
 };
-
-const API_BASE = "http://localhost:8000";
 type RootName = string;
 
 type StagingStats = {
-  images: number;
-  videos: number;
-  raw: number;
-  other: number;
-  dirs: number;
-  total_files: number;
+  images: number; videos: number; raw: number; other: number; dirs: number; total_files: number;
 };
 
-// Detect videos by extension; keep in sync with backend TOML [ext.video]
+type ExifValue = string | number | boolean | null | undefined;
+type ExifData = Record<string, ExifValue>;
+
+const API_BASE = "http://localhost:8000";
+
+// Helpers
 function looksLikeVideo(name: string): boolean {
   const ext = (name.split(".").pop() || "").toLowerCase();
   return ["mp4", "mov", "m4v", "webm", "mkv", "avi"].includes(ext);
 }
-
-// Add/replace ?h= on a thumb URL to request a taller JPEG (good for HEIC)
 function withHeight(url: string, h: number): string {
   try {
     const u = new URL(url, window.location.origin);
@@ -59,38 +35,44 @@ function withHeight(url: string, h: number): string {
     return `${base}?${params.toString()}`;
   }
 }
-
-// Discriminated union for preview source (helps TS avoid implicit anys)
-type MediaSrc =
-  | { kind: "image"; url: string }
-  | { kind: "video"; url: string }
-  | null;
-
-/* ----------------------------------------------------------------------------
-   Component
----------------------------------------------------------------------------- */
+function toErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 export default function StagingView({ theme }: { theme: Theme }) {
-  // Routing state (source root + path inside it)
+  // Routing
   const [roots, setRoots] = useState<RootName[]>([]);
   const [root, setRoot] = useState<RootName | "">("");
   const [path, setPath] = useState<string>("");
 
-  // Data + selection for the grid
+  // Data + selection
   const [entries, setEntries] = useState<StagingEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<StagingEntry | null>(null);
 
-  // Stats for toolbar pills
+  // Stats
   const [stats, setStats] = useState<StagingStats | null>(null);
   const [statsError, setStatsError] = useState<string | null>(null);
 
-  // EXIF state: table is always visible; "expanded" shows all fields
+  // EXIF UI
   const [exifExpanded, setExifExpanded] = useState(false);
   const [exifData, setExifData] = useState<ExifData | null>(null);
   const [exifErr, setExifErr] = useState<string | null>(null);
 
-  // Load available staging roots on mount
+  // Selected → preview DTO (memo to avoid eslint deps warning)
+  const selectedPreview = useMemo(() => {
+    if (!selected || selected.is_dir) return null;
+    return {
+      name: selected.name,
+      is_dir: false,
+      rel_path: selected.rel_path,
+      media_url: selected.media_url ?? undefined,
+      thumb_url: selected.thumb_url ?? undefined,
+      ext: selected.name.split(".").pop()?.toLowerCase(),
+    };
+  }, [selected]);
+
+  // Roots
   useEffect(() => {
     fetch(`${API_BASE}/api/staging/roots`)
       .then((r) => r.json())
@@ -101,7 +83,7 @@ export default function StagingView({ theme }: { theme: Theme }) {
       .catch((e) => setError(`failed to load roots: ${String(e)}`));
   }, []);
 
-  // Load entries whenever root/path changes
+  // Entries
   useEffect(() => {
     if (!root) return;
     const params = new URLSearchParams();
@@ -116,13 +98,13 @@ export default function StagingView({ theme }: { theme: Theme }) {
       .then((list: StagingEntry[]) => {
         setEntries(list);
         setError(null);
-        setSelected(null);       // clear preview when navigating
-        setExifExpanded(false);  // collapse EXIF on folder change
+        setSelected(null);       // clear preview on nav
+        setExifExpanded(false);  // collapse EXIF on nav
       })
       .catch((e) => setError(`failed to list: ${String(e)}`));
   }, [root, path]);
 
-  // Fetch stats for toolbar
+  // Stats
   useEffect(() => {
     if (!root) return;
     const params = new URLSearchParams();
@@ -141,40 +123,40 @@ export default function StagingView({ theme }: { theme: Theme }) {
       .catch((e) => setStatsError(`failed to load stats: ${String(e)}`));
   }, [root, path]);
 
-  // EXIF: always load basic fields for the selected file (panel is always visible)
+  // EXIF fetch (from backend)
   useEffect(() => {
     let cancelled = false;
 
-    if (!selected || selected.is_dir) {
+    if (!selectedPreview || !root) {
       setExifData(null);
       setExifErr(null);
-      return () => {
-        cancelled = true;
-      };
+      return () => { cancelled = true; };
     }
+
+    const params = new URLSearchParams({
+      root,
+      path: selectedPreview.rel_path,
+      compact: "true",
+    });
 
     (async () => {
       try {
-        // TODO: replace with real API call (e.g., /api/staging/exif?root=&path=)
-        // Provide a few useful basics so collapsed view has content.
-        const d: ExifData = {
-          Filename: selected.name,
-          Modified: selected.mtime ?? "",
-          Size: selected.size ?? "",
-          Path: selected.rel_path,
-        };
-        if (!cancelled) setExifData(d);
+        const r = await fetch(`${API_BASE}/api/staging/exif?${params.toString()}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = (await r.json()) as ExifData;
+        if (!cancelled) {
+          setExifData(d);
+          setExifErr(null);
+        }
       } catch (e: unknown) {
         if (!cancelled) setExifErr(toErrorMessage(e));
       }
     })();
 
-    return () => {
-      cancelled = true;
-    };
-  }, [selected]);
+    return () => { cancelled = true; };
+  }, [selectedPreview, root]);
 
-  // Breadcrumbs from current path
+  // Breadcrumbs
   const crumbs = useMemo(() => {
     const parts = path ? path.split("/").filter(Boolean) : [];
     const acc: { name: string; p: string }[] = [];
@@ -186,7 +168,7 @@ export default function StagingView({ theme }: { theme: Theme }) {
     return acc;
   }, [path]);
 
-  // Navigation helpers
+  // Nav helpers
   function goUp() {
     if (!path) return;
     const idx = path.lastIndexOf("/");
@@ -197,23 +179,20 @@ export default function StagingView({ theme }: { theme: Theme }) {
     setPath(entry.rel_path);
   }
 
-  // Compute a preview URL for the right pane (image or video)
-  const previewSrc = useMemo<MediaSrc>(() => {
-    if (!selected || selected.is_dir) return null;
-
-    if (looksLikeVideo(selected.name)) {
-      return { kind: "video", url: selected.media_url ?? "" };
+  // Right-pane preview URL
+  const previewSrc = useMemo(() => {
+    if (!selectedPreview) return null;
+    if (selectedPreview.ext && looksLikeVideo(selectedPreview.ext)) {
+      return { kind: "video" as const, url: selectedPreview.media_url ?? "" };
     }
-    if (selected.thumb_url) {
-      return { kind: "image", url: withHeight(selected.thumb_url, 1200) };
+    if (selectedPreview.thumb_url) {
+      return { kind: "image" as const, url: withHeight(selectedPreview.thumb_url, 1200) };
     }
-    if (selected.media_url) {
-      return { kind: "image", url: selected.media_url };
+    if (selectedPreview.media_url) {
+      return { kind: "image" as const, url: selectedPreview.media_url };
     }
     return null;
-  }, [selected]);
-
-  /* ------------------------------------------------------------------------ */
+  }, [selectedPreview]);
 
   return (
     <section
@@ -230,127 +209,47 @@ export default function StagingView({ theme }: { theme: Theme }) {
         color: theme.text,
       }}
     >
-      {/* Row 1: toolbar */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 0,
-          flexWrap: "wrap",
-          color: theme.text,
-          transform: "translateY(8px)",
-          width: "100%",
-        }}
-      >
-        {/* Left-side controls */}
+      {/* toolbar */}
+      <div style={{ display: "flex", alignItems: "center", gap: 0, flexWrap: "wrap", color: theme.text, transform: "translateY(8px)", width: "100%" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
           <label>
             source:&nbsp;
             <select
               value={root}
-              onChange={(e) => {
-                setRoot(e.target.value);
-                setPath("");
-              }}
-              style={{
-                background: theme.surface,
-                color: theme.text,
-                border: `1px solid ${theme.border}`,
-                borderRadius: 8,
-                padding: "6px 8px",
-              }}
+              onChange={(e) => { setRoot(e.target.value); setPath(""); }}
+              style={{ background: theme.surface, color: theme.text, border: `1px solid ${theme.border}`, borderRadius: 8, padding: "6px 8px" }}
             >
-              <option value="" disabled>
-                select…
-              </option>
-              {roots.map((r) => (
-                <option key={r} value={r}>
-                  {r}
-                </option>
-              ))}
+              <option value="" disabled>select…</option>
+              {roots.map((r) => <option key={r} value={r}>{r}</option>)}
             </select>
           </label>
 
           <div style={{ color: theme.muted }}>
             path:&nbsp;
-            <button
-              onClick={() => setPath("")}
-              style={{
-                border: "none",
-                background: "transparent",
-                textDecoration: "underline",
-                cursor: "pointer",
-                padding: 0,
-                color: theme.text,
-              }}
-              title="go to root"
-            >
-              /
-            </button>
+            <button onClick={() => setPath("")} style={{ border: "none", background: "transparent", textDecoration: "underline", cursor: "pointer", padding: 0, color: theme.text }} title="go to root">/</button>
             {crumbs.map((c) => (
               <span key={c.p}>
                 <span>&nbsp;/&nbsp;</span>
-                <button
-                  onClick={() => setPath(c.p)}
-                  style={{
-                    border: "none",
-                    background: "transparent",
-                    textDecoration: "underline",
-                    cursor: "pointer",
-                    padding: 0,
-                    color: theme.text,
-                  }}
-                  title={`go to ${c.p}`}
-                >
-                  {c.name}
-                </button>
+                <button onClick={() => setPath(c.p)} style={{ border: "none", background: "transparent", textDecoration: "underline", cursor: "pointer", padding: 0, color: theme.text }} title={`go to ${c.p}`}>{c.name}</button>
               </span>
             ))}
           </div>
 
-          <button
-            onClick={goUp}
-            disabled={!path}
-            style={{
-              padding: "6px 10px",
-              borderRadius: 8,
-              border: `1px solid ${theme.border}`,
-              background: theme.surface,
-              color: theme.text,
-              cursor: path ? "pointer" : "not-allowed",
-              opacity: path ? 1 : 0.5,
-            }}
-          >
+          <button onClick={goUp} disabled={!path} style={{ padding: "6px 10px", borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, cursor: path ? "pointer" : "not-allowed", opacity: path ? 1 : 0.5 }}>
             ↑ up
           </button>
         </div>
 
-        {/* Right-side: counters */}
+        {/* counters */}
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
           {statsError && <span style={{ color: "#fca5a5", fontSize: 12 }}>{statsError}</span>}
-
           {[
             { icon: "📷", label: "Images", val: stats?.images },
             { icon: "🎞️", label: "Videos", val: stats?.videos },
             { icon: "📁", label: "Folders", val: stats?.dirs },
-            { icon: "🧩", label: "Other", val: stats?.other },
+            { icon: "🧩", label: "Other",  val: stats?.other },
           ].map((p) => (
-            <div
-              key={p.label}
-              title={p.label}
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-                padding: "4px 8px",
-                borderRadius: 999,
-                border: `1px solid ${theme.border}`,
-                background: theme.surface,
-                color: theme.text,
-                fontSize: 12,
-                lineHeight: 1,
-              }}
-            >
+            <div key={p.label} title={p.label} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 8px", borderRadius: 999, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12, lineHeight: 1 }}>
               <span aria-hidden>{p.icon}</span>
               <strong style={{ fontWeight: 600 }}>{p.label}</strong>
               <span style={{ color: theme.muted }}>·</span>
@@ -360,16 +259,9 @@ export default function StagingView({ theme }: { theme: Theme }) {
         </div>
       </div>
 
-      {/* Row 2: two-column content → left grid, right preview */}
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "1fr minmax(320px, 38%)",
-          gap: 12,
-          minHeight: 0,
-        }}
-      >
-        {/* LEFT: items grid */}
+      {/* content: grid + preview */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr minmax(360px, 40%)", gap: 12, minHeight: 0 }}>
+        {/* LEFT: grid */}
         <div
           style={{
             display: "grid",
@@ -389,35 +281,17 @@ export default function StagingView({ theme }: { theme: Theme }) {
           {error && <div style={{ gridColumn: "1 / -1", color: "#fca5a5" }}>{error}</div>}
 
           {!error && entries.length === 0 && (
-            <div
-              style={{
-                gridColumn: "1 / -1",
-                display: "grid",
-                placeItems: "center",
-                height: "100%",
-                color: theme.muted,
-                textAlign: "center",
-              }}
-            >
+            <div style={{ gridColumn: "1 / -1", display: "grid", placeItems: "center", height: "100%", color: theme.muted, textAlign: "center" }}>
               <div>
                 <div style={{ fontSize: 28, marginBottom: 6 }}>🗂️</div>
-                <div>
-                  No items here. <strong>Select a folder</strong> to view files.
-                </div>
+                <div>No items here. <strong>Select a folder</strong> to view files.</div>
               </div>
             </div>
           )}
 
           {entries.map((e) => {
             const isDir = e.is_dir;
-            const isSelected = !!selected && !isDir && selected.rel_path === e.rel_path;
-
-            // CLICK: folders open; files select for preview
-            const onClick = () => {
-              if (isDir) openDir(e);
-              else setSelected(e);
-            };
-
+            const onClick = () => (isDir ? openDir(e) : setSelected(e));
             return (
               <button
                 key={e.rel_path || e.name}
@@ -427,8 +301,7 @@ export default function StagingView({ theme }: { theme: Theme }) {
                   flexDirection: "column",
                   gap: 6,
                   textAlign: "left",
-                  border: `1px solid ${isSelected ? theme.accentBorder : theme.border}`,
-                  boxShadow: isSelected ? `0 0 0 2px ${theme.accentBorder} inset` : undefined,
+                  border: `1px solid ${theme.border}`,
                   borderRadius: 10,
                   padding: 6,
                   background: theme.cardBg,
@@ -439,48 +312,18 @@ export default function StagingView({ theme }: { theme: Theme }) {
                 title={e.rel_path}
               >
                 {isDir ? (
-                  <div
-                    style={{
-                      height: 140,
-                      borderRadius: 8,
-                      border: `1px dashed ${theme.border}`,
-                      display: "grid",
-                      placeItems: "center",
-                      background: "#0e1014",
-                      fontSize: 32,
-                      color: theme.text,
-                    }}
-                  >
+                  <div style={{ height: 140, borderRadius: 8, border: `1px dashed ${theme.border}`, display: "grid", placeItems: "center", background: "#0e1014", fontSize: 32, color: theme.text }}>
                     📁
                   </div>
                 ) : e.media_url ? (
                   <Thumb src={(e.thumb_url ?? e.media_url)!} alt={e.name} height={140} fit="cover" />
                 ) : (
-                  <div
-                    style={{
-                      height: 140,
-                      borderRadius: 8,
-                      border: `1px dashed ${theme.border}`,
-                      display: "grid",
-                      placeItems: "center",
-                      background: "#0e1014",
-                      color: theme.muted,
-                      fontSize: 12,
-                    }}
-                  >
+                  <div style={{ height: 140, borderRadius: 8, border: `1px dashed ${theme.border}`, display: "grid", placeItems: "center", background: "#0e1014", color: theme.muted, fontSize: 12 }}>
                     preview unavailable
                   </div>
                 )}
 
-                <div
-                  style={{
-                    fontSize: 12,
-                    color: theme.text,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                >
+                <div style={{ fontSize: 12, color: theme.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {e.name}
                 </div>
                 <div className="muted" style={{ fontSize: 11, color: theme.muted }}>
@@ -491,27 +334,27 @@ export default function StagingView({ theme }: { theme: Theme }) {
           })}
         </div>
 
-        {/* RIGHT: preview panel */}
+        {/* RIGHT: preview panel (image/video on top, EXIF below) */}
         <div
           style={{
             border: `1px solid ${theme.border}`,
             borderRadius: 10,
             background: theme.surface,
             padding: 12,
-            display: "flex",
-            flexDirection: "column",
+            display: "grid",
+            gridTemplateRows: "auto minmax(220px, 1fr) auto",
+            gap: 10,
             minHeight: 0,
           }}
         >
           {/* header */}
-          <div style={{ fontSize: 13, marginBottom: 8, color: theme.text }}>
-            {selected ? selected.name : "Select a file to preview"}
+          <div style={{ fontSize: 13, color: theme.text }}>
+            {selectedPreview ? selectedPreview.name : "Select a file to preview"}
           </div>
 
           {/* media */}
           <div
             style={{
-              flex: 1,
               minHeight: 0,
               display: "grid",
               placeItems: "center",
@@ -520,131 +363,112 @@ export default function StagingView({ theme }: { theme: Theme }) {
               overflow: "hidden",
             }}
           >
-            {!selected ? (
+            {!selectedPreview ? (
               <div style={{ color: theme.muted, fontSize: 12 }}>Nothing selected</div>
-            ) : selected.is_dir ? (
-              <div style={{ color: theme.muted, fontSize: 12 }}>Folders don’t have a preview</div>
             ) : !previewSrc ? (
               <div style={{ color: theme.muted, fontSize: 12 }}>No preview available</div>
             ) : previewSrc.kind === "image" ? (
               <img
                 src={previewSrc.url}
-                alt={selected.name}
-                style={{ maxHeight: "75vh", maxWidth: "100%", objectFit: "contain" }}
+                alt={selectedPreview.name}
+                style={{ maxHeight: "70vh", maxWidth: "100%", objectFit: "contain" }}
               />
             ) : (
-              <video src={previewSrc.url} controls style={{ maxHeight: "75vh", maxWidth: "100%" }} />
+              <video src={previewSrc.url} controls style={{ maxHeight: "70vh", maxWidth: "100%" }} />
             )}
           </div>
 
-          {/* footer actions — EXIF on left, Remove on right */}
-          <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center" }}>
-            <button
-              onClick={() => setExifExpanded((v) => !v)}
-              disabled={!selected || selected.is_dir}
+          {/* actions + EXIF */}
+          <div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+              <button
+                onClick={() => setExifExpanded(v => !v)}
+                disabled={!selectedPreview}
+                style={{
+                  padding: "6px 10px",
+                  borderRadius: 8,
+                  border: `1px solid ${theme.border}`,
+                  background: theme.cardBg,
+                  color: theme.text,
+                  cursor: selectedPreview ? "pointer" : "not-allowed",
+                  opacity: selectedPreview ? 1 : 0.5,
+                }}
+                title={exifExpanded ? "Hide additional EXIF fields" : "Show all EXIF fields"}
+              >
+                {exifExpanded ? "Hide EXIF" : "Show EXIF"}
+              </button>
+
+              <div style={{ marginLeft: "auto" }} />
+
+              <button
+                disabled={!selectedPreview}
+                onClick={() => selectedPreview && alert(`Delete: ${selectedPreview.name}`)}
+                style={{
+                  padding: "6px 10px",
+                  borderRadius: 8,
+                  border: "1px solid #7f1d1d",
+                  background: "#2a0b0b",
+                  color: "#ef4444",
+                  cursor: selectedPreview ? "pointer" : "not-allowed",
+                  opacity: selectedPreview ? 1 : 0.5,
+                }}
+                title="Delete from Staging (cannot be undone)"
+                aria-label="Delete from Staging"
+              >
+                🗑️ Delete
+              </button>
+            </div>
+
+            <div
               style={{
-                padding: "6px 10px",
-                borderRadius: 8,
-                border: `1px solid ${theme.border}`,
-                background: theme.cardBg,
+                borderTop: `1px solid ${theme.border}`,
+                paddingTop: 10,
+                fontSize: 12,
                 color: theme.text,
-                cursor: !selected || selected.is_dir ? "not-allowed" : "pointer",
-                opacity: !selected || selected.is_dir ? 0.5 : 1,
+                maxHeight: exifExpanded ? 320 : 200,
+                overflow: "auto",
               }}
-              title={exifExpanded ? "Hide additional EXIF fields" : "Show all EXIF fields"}
             >
-              {exifExpanded ? "Hide EXIF" : "Show EXIF"}
-            </button>
+              {!selectedPreview ? (
+                <div style={{ color: theme.muted }}>Select a file to view EXIF</div>
+              ) : exifErr ? (
+                <div style={{ color: "#fca5a5" }}>Failed to load EXIF: {exifErr}</div>
+              ) : !exifData ? (
+                <div style={{ color: theme.muted }}>Loading…</div>
+              ) : (
+                (() => {
+                  const entries = Object.entries(exifData) as Array<[string, ExifValue]>;
+                  const primaryKeys = new Set([
+                    "Basic:Filename", "Basic:Modified", "Basic:Size", "Basic:Path",
+                    "EXIF:DateTimeOriginal", "EXIF:CreateDate", "QuickTime:CreateDate",
+                    "EXIF:Make", "EXIF:Model", "EXIF:GPSLatitude", "EXIF:GPSLongitude",
+                  ]);
+                  const primary = entries.filter(([k]) => primaryKeys.has(k));
+                  const visible = exifExpanded ? entries : (primary.length ? primary : entries.slice(0, 8));
+                  const hiddenCount = exifExpanded ? 0 : Math.max(entries.length - visible.length, 0);
 
-            <div style={{ marginLeft: "auto" }} />
-
-            {/* Dangerous action: red visuals to indicate deletion/removal */}
-            <button
-              disabled={!selected || selected.is_dir}
-              onClick={() => selected && !selected.is_dir && alert(`Remove: ${selected.name}`)}
-              style={{
-                padding: "6px 10px",
-                borderRadius: 8,
-                border: "1px solid #7f1d1d", // dark red border
-                background: "#2a0b0b",       // subtle red-tinted bg
-                color: "#ef4444",            // red text
-                cursor: !selected || selected.is_dir ? "not-allowed" : "pointer",
-                opacity: !selected || selected.is_dir ? 0.5 : 1,
-              }}
-              title="Delete from Staging (cannot be undone)"
-              aria-label="Delete from Staging"
-            >
-              🗑️ Delete
-            </button>
-          </div>
-
-          {/* EXIF is always rendered: show a few key fields; expand to show all */}
-          <div
-            style={{
-              marginTop: 10,
-              borderTop: `1px solid ${theme.border}`,
-              paddingTop: 10,
-              fontSize: 12,
-              color: theme.text,
-              maxHeight: exifExpanded ? 320 : 200,
-              overflow: "auto",
-            }}
-          >
-            {!selected || selected.is_dir ? (
-              <div style={{ color: theme.muted }}>Select a file to view EXIF</div>
-            ) : exifErr ? (
-              <div style={{ color: "#fca5a5" }}>Failed to load EXIF: {exifErr}</div>
-            ) : !exifData ? (
-              <div style={{ color: theme.muted }}>Loading…</div>
-            ) : (
-              (() => {
-                // Show a small “primary” subset when collapsed; everything when expanded.
-                const entries = Object.entries(exifData) as Array<[string, ExifValue]>;
-                const primaryKeys = new Set([
-                  "Filename",
-                  "TakenAt",
-                  "Modified",
-                  "Size",
-                  "Path",
-                  "GPSLat",
-                  "GPSLon",
-                  "Make",
-                  "Model",
-                ]);
-                const primary = entries.filter(([k]) => primaryKeys.has(k));
-                const visible = exifExpanded ? entries : primary.length ? primary : entries.slice(0, 8);
-                const hiddenCount = exifExpanded ? 0 : Math.max(entries.length - visible.length, 0);
-
-                return (
-                  <>
-                    <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                      <tbody>
-                        {visible.map(([k, v]) => (
-                          <tr key={k} style={{ borderBottom: `1px solid ${theme.border}` }}>
-                            <td
-                              style={{
-                                padding: "6px 8px",
-                                color: theme.muted,
-                                whiteSpace: "nowrap",
-                                verticalAlign: "top",
-                              }}
-                            >
-                              {k}
-                            </td>
-                            <td style={{ padding: "6px 8px", wordBreak: "break-word" }}>{String(v ?? "")}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                    {!exifExpanded && hiddenCount > 0 && (
-                      <div style={{ marginTop: 6, color: theme.muted }}>
-                        {hiddenCount} more field{hiddenCount === 1 ? "" : "s"} hidden. Click “Show EXIF” to expand.
-                      </div>
-                    )}
-                  </>
-                );
-              })()
-            )}
+                  return (
+                    <>
+                      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                        <tbody>
+                          {visible.map(([k, v]) => (
+                            <tr key={k} style={{ borderBottom: `1px solid ${theme.border}` }}>
+                              <td style={{ padding: "6px 8px", color: theme.muted, whiteSpace: "nowrap", verticalAlign: "top" }}>{k}</td>
+                              <td style={{ padding: "6px 8px", wordBreak: "break-word" }}>{String(v ?? "")}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      {!exifExpanded && hiddenCount > 0 && (
+                        <div style={{ marginTop: 6, color: theme.muted }}>
+                          {hiddenCount} more field{hiddenCount === 1 ? "" : "s"} hidden. Click “Show EXIF” to expand.
+                        </div>
+                      )}
+                    </>
+                  );
+                })()
+              )}
+            </div>
           </div>
         </div>
       </div>

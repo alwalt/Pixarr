@@ -31,6 +31,7 @@ export type PreviewItem = {
   media_url?: string;  // original file (video uses this)
   thumb_url?: string;  // server-rendered JPEG (works for HEIC)
   ext?: string;        // optional (e.g., ".heic", ".mp4")
+  rel_path?: string;
 };
 
 export type ExifData = Record<string, string | number | null | undefined>;

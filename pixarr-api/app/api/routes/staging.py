@@ -19,6 +19,8 @@ from app.core.config import (
 from app.utils.http import safe_rel_under, abs_url
 from app.utils.thumbs import serve_or_build_thumb
 from app.schemas.media import StagingEntry, StagingStats
+from app.services.metadata import read_metadata  # <- service that calls exiftool / Pillow
+
 
 # Router mounted under /api in main.py (→ /api/staging/...)
 api_router = APIRouter(prefix="/staging", tags=["staging"])
@@ -186,3 +188,21 @@ def get_staging_thumb(root: str, path: str, h: int = 220):
         raise HTTPException(status_code=404, detail="file not found")
 
     return serve_or_build_thumb(abs_path, h)
+
+@api_router.get("/exif")
+def api_staging_exif(root: str, path: str, compact: bool = True):
+    base = resolve_staging_root(root)
+    abs_path = (base / path).resolve()
+
+    if safe_rel_under(base, abs_path) is None:
+        raise HTTPException(status_code=403, detail="forbidden path")
+    if not abs_path.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+
+    meta = read_metadata(abs_path, compact=compact)
+
+    # Tag the area generically for the UI; still not a per-field mapper
+    meta.setdefault("_area", "staging")
+    meta.setdefault("_root", root)
+    meta.setdefault("_rel_path", path)
+    return meta
