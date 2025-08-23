@@ -65,6 +65,17 @@ function toErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Convert raw bytes to a human‑readable string (e.g. "2.4 MB"). */
+function formatBytes(bytes?: number | null): string {
+  if (bytes == null || isNaN(bytes as number)) return "";
+  if (bytes === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(bytes as number) / Math.log(1024));
+  const val = (bytes as number) / Math.pow(1024, i);
+  return `${val.toFixed(1)} ${units[i]}`;
+}
+
+
 /* ========================================================================== */
 /*  Component                                                                 */
 /* ========================================================================== */
@@ -109,6 +120,10 @@ export default function StagingView({
 
   // Lightweight “refresh” tick (used after Sync completes to refetch list/stats)
   const [refreshTick, setRefreshTick] = useState(0);
+
+  // Sync button state (disable while running)
+  const [syncing, setSyncing] = useState(false);
+
 
   /* ------------------------------------------------------------------------ */
   /*  Derived selection → preview DTO                                         */
@@ -407,31 +422,28 @@ export default function StagingView({
   /* ------------------------------------------------------------------------ */
 
   async function runSync() {
-    try {
-      const res = await fetch(`${API_BASE}/api/staging/sync/icloud`, { method: "POST" });
-      const data = await res.json();
+  setSyncing(true);
+  try {
+    const res = await fetch(`${API_BASE}/api/staging/sync/icloud`, { method: "POST" });
+    const data = await res.json();
 
-      if (data.status === "busy") {
-        alert("Sync is already running — please wait.");
-        return;
-      }
-      if (data.status === "error") {
-        alert(`Config error:\n${data.msg}`);
-        return;
-      }
-
-      if (data.exit_code === 0) {
-        alert("iCloud sync completed!");
-        // Nudge list/stats to refresh (especially helpful for icloud root)
-        setRefreshTick((t) => t + 1);
-      } else {
-        const msg = data.stderr || data.stdout || "No output";
-        alert(`Sync failed (code ${data.exit_code}):\n${msg}`);
-      }
-    } catch (e) {
-      alert(`Failed to trigger sync: ${String(e)}`);
+    if (data.status === "busy") {
+      alert("Sync is already running — please wait.");
+    } else if (data.status === "error") {
+      alert(`Config error:\n${data.msg}`);
+    } else if (data.exit_code === 0) {
+      alert("iCloud sync completed!");
+      setRefreshTick((t) => t + 1);
+    } else {
+      alert(`Sync failed (code ${data.exit_code}):\n${data.stderr || data.stdout || "No output"}`);
     }
+  } catch (e) {
+    alert(`Failed to trigger sync: ${String(e)}`);
+  } finally {
+    setSyncing(false);
   }
+}
+
 
   /* ------------------------------------------------------------------------ */
   /*  Render                                                                   */
@@ -490,12 +502,18 @@ export default function StagingView({
           {/* SYNC */}
           <button
             onClick={runSync}
+            disabled={syncing}
             className="px-pill px-action"
-            style={{ padding: "0 8px" }} // keep height via class, adjust padding only
+            style={{
+              padding: "0 8px",
+              cursor: syncing ? "not-allowed" : "pointer",
+              opacity: syncing ? 0.6 : 1,
+            }}
             title="Sync staging folders (icloudpd)"
           >
-            🔄 Sync
+            {syncing ? "⏳ Syncing…" : "🔄 Sync"}
           </button>
+
 
           {/* MOVE TO REVIEW: split button with scope menu */}
           <div ref={moveMenuRef} style={{ position: "relative", display: "inline-flex" }}>
@@ -724,7 +742,12 @@ export default function StagingView({
             boxSizing: "border-box",
             background: theme.surface,
             minHeight: 0,
-            alignItems: "start",
+             // 👇 prevent rows from being stretched to fill the container
+            alignItems: "start",     // items don’t stretch vertically
+            alignContent: "start",   // rows pack at the top instead of stretching
+
+            // optional: make each row height fit content tightly
+            gridAutoRows: "min-content",
           }}
         >
           {error && <div style={{ gridColumn: "1 / -1", color: "#fca5a5" }}>{error}</div>}
@@ -823,7 +846,7 @@ export default function StagingView({
                   {e.name}
                 </div>
                 <div className="muted" style={{ fontSize: 11, color: theme.muted }}>
-                  {e.is_dir ? "folder" : `${e.size ?? ""} bytes`} {e.mtime ? `• ${e.mtime}` : ""}
+                  {e.is_dir ? "folder" : formatBytes(e.size)} {e.mtime ? `• ${e.mtime}` : ""}
                 </div>
               </button>
             );

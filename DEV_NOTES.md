@@ -788,3 +788,53 @@ When building Review/Quarantine/Library:
 Handled via the **thumb** endpoint. The browser displays JPEGs returned by `/thumb/...`; originals remain HEIC on disk.
 
 ---
+
+### iCloud Sync Integration
+
+**Frontend (StagingView\.tsx)**
+
+* Added a **Sync** button in the toolbar.
+* State:
+
+  * `syncing` (`boolean`) tracks if a sync is running.
+  * When `true`, the button is disabled, semi-transparent, shows `"⏳ Syncing…"`.
+  * When finished or errored, resets to `"🔄 Sync"`.
+* Calls `POST /api/staging/sync/icloud`.
+* Shows alert messages depending on API response:
+
+  * `"busy"` → already running (backend lock held).
+  * `"error"` → misconfigured `[icloud]` section in `pixarr.toml`.
+  * `"done"` → includes `exit_code`, `stdout`, `stderr`.
+* Button styles use `cursor: not-allowed` + reduced opacity to reinforce disabled state.
+
+**Backend (staging.py)**
+
+* Endpoint: `POST /api/staging/sync/icloud`.
+* Uses `asyncio.Lock` (`_icloud_sync_lock`) to enforce **only one sync at a time**.
+
+  * If lock is already held, returns `{"status": "busy"}` immediately.
+* Command built via `build_icloudpd_cmd()` in `config.py`.
+
+  * Pulls values from `[icloud]` in `pixarr.toml`.
+  * Auto-enabled if `apple_id` present and `enabled` not explicitly set to `false`.
+* Runs `icloudpd` as a subprocess; waits for completion.
+* Returns a JSON object with exit code, stdout, stderr, and executed command (for debug).
+
+**Config (pixarr.toml)**
+
+* `[icloud]` block required to enable sync.
+* Example:
+
+```toml
+[icloud]
+apple_id = "walt.alvarado@me.com"
+cookie_dir     = "icloud-cookies"
+staging_subdir = "media/Staging/icloud"
+recent         = 5
+```
+
+* If `enabled` is omitted but `apple_id` exists → iCloud sync is automatically enabled.
+* If `enabled = false` → API will reject sync requests.
+
+---
+
