@@ -53,13 +53,20 @@
   cursor: pointer;
   transition: background .15s ease, color .15s ease, border-color .15s ease, opacity .15s ease;
 }
-.px-action:hover,
-.px-action:focus {
+
+/* Only hover should show the blue accent */
+.px-action:hover {
   background: var(--accent);
   color: #fff;
   border-color: var(--accent-border);
-  outline: none;
 }
+
+/* Optional: keep a minimal visible focus ring */
+.px-action:focus {
+  outline: 2px solid var(--accent-border);
+  outline-offset: 2px;
+}
+
 
 /* Split button utilities */
 .px-split-left  { border-top-right-radius: 0; border-bottom-right-radius: 0; }
