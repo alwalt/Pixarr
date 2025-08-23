@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+// src/components/StagingView.tsx
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { StagingEntry } from "../types";
 import Thumb from "./Thumb";
 
-// Types
+/* ========= Types ========= */
 type Theme = {
   appBg: string; headerBg: string; surface: string; cardBg: string;
   border: string; text: string; muted: string; accent: string; accentBorder: string;
@@ -16,13 +17,25 @@ type StagingStats = {
 type ExifValue = string | number | boolean | null | undefined;
 type ExifData = Record<string, ExifValue>;
 
+/** Matches App.tsx (duplicated locally to avoid import cycles) */
+export type StagingSavedState = {
+  root: string;
+  path: string;
+  selectedRel?: string;
+  scrollTop?: number;
+};
+
 const API_BASE = "http://localhost:8000";
 
-// Helpers
+/* ========= Helpers ========= */
+
+/** Decide if extension is a video; used for preview rendering. */
 function looksLikeVideo(name: string): boolean {
   const ext = (name.split(".").pop() || "").toLowerCase();
   return ["mp4", "mov", "m4v", "webm", "mkv", "avi"].includes(ext);
 }
+
+/** Append/override height query to thumb URLs (server scales). */
 function withHeight(url: string, h: number): string {
   try {
     const u = new URL(url, window.location.origin);
@@ -35,31 +48,50 @@ function withHeight(url: string, h: number): string {
     return `${base}?${params.toString()}`;
   }
 }
+
+/** Normalize thrown values → string messages for UI. */
 function toErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-export default function StagingView({ theme }: { theme: Theme }) {
-  // Routing
-  const [roots, setRoots] = useState<RootName[]>([]);
-  const [root, setRoot] = useState<RootName | "">("");
-  const [path, setPath] = useState<string>("");
+/* ========= Component ========= */
 
-  // Data + selection
+export default function StagingView({
+  theme,
+  savedState,
+  onSavedStateChange,
+}: {
+  theme: Theme;
+  /** Provided by App so your place survives tab switches */
+  savedState: StagingSavedState;
+  /** Call this whenever root/path/selection/scroll changes */
+  onSavedStateChange: (s: StagingSavedState) => void;
+}) {
+  /* ----- Routing (lifted defaults restored from savedState) ----- */
+  const [roots, setRoots] = useState<RootName[]>([]);
+  // IMPORTANT: do not auto-select a root by default. Start with saved value or "".
+  const [root, setRoot] = useState<RootName | "">(savedState.root || "");
+  const [path, setPath] = useState<string>(savedState.path || "");
+
+  /* ----- Data + selection ----- */
   const [entries, setEntries] = useState<StagingEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<StagingEntry | null>(null);
 
-  // Stats
+  /* ----- Stats ----- */
   const [stats, setStats] = useState<StagingStats | null>(null);
   const [statsError, setStatsError] = useState<string | null>(null);
 
-  // EXIF UI
+  /* ----- EXIF UI ----- */
   const [exifExpanded, setExifExpanded] = useState(false);
   const [exifData, setExifData] = useState<ExifData | null>(null);
   const [exifErr, setExifErr] = useState<string | null>(null);
 
-  // Selected → preview DTO (memo to avoid eslint deps warning)
+  /* ----- Scroll persistence ----- */
+  const gridRef = useRef<HTMLDivElement | null>(null);
+  const scrollRAF = useRef<number | null>(null);
+
+  /* ----- Selected → preview DTO ----- */
   const selectedPreview = useMemo(() => {
     if (!selected || selected.is_dir) return null;
     return {
@@ -72,20 +104,20 @@ export default function StagingView({ theme }: { theme: Theme }) {
     };
   }, [selected]);
 
-  // Roots
+  /* ----- Roots fetch (no auto-pick) ----- */
   useEffect(() => {
     fetch(`${API_BASE}/api/staging/roots`)
       .then((r) => r.json())
       .then((list: RootName[]) => {
         setRoots(list);
-        if (list.length) setRoot((prev) => prev || list[0]);
+        // DO NOT set a default root here. Keep current root as-is.
       })
       .catch((e) => setError(`failed to load roots: ${String(e)}`));
   }, []);
 
-  // Entries
+  /* ----- Entries fetch (depends on root/path) ----- */
   useEffect(() => {
-    if (!root) return;
+    if (!root) return; // require explicit selection
     const params = new URLSearchParams();
     params.set("root", root);
     if (path) params.set("path", path);
@@ -98,13 +130,13 @@ export default function StagingView({ theme }: { theme: Theme }) {
       .then((list: StagingEntry[]) => {
         setEntries(list);
         setError(null);
-        setSelected(null);       // clear preview on nav
-        setExifExpanded(false);  // collapse EXIF on nav
+        // UX: collapse EXIF on nav changes; we try to restore selection separately
+        setExifExpanded(false);
       })
       .catch((e) => setError(`failed to list: ${String(e)}`));
   }, [root, path]);
 
-  // Stats
+  /* ----- Stats fetch ----- */
   useEffect(() => {
     if (!root) return;
     const params = new URLSearchParams();
@@ -123,7 +155,7 @@ export default function StagingView({ theme }: { theme: Theme }) {
       .catch((e) => setStatsError(`failed to load stats: ${String(e)}`));
   }, [root, path]);
 
-  // EXIF fetch (from backend)
+  /* ----- EXIF fetch (from backend) ----- */
   useEffect(() => {
     let cancelled = false;
 
@@ -156,7 +188,52 @@ export default function StagingView({ theme }: { theme: Theme }) {
     return () => { cancelled = true; };
   }, [selectedPreview, root]);
 
-  // Breadcrumbs
+  /* ----- Restore selection + scroll after entries load ----- */
+  useEffect(() => {
+    // Attempt to restore the previously selected item by rel_path
+    if (savedState?.selectedRel && entries.length) {
+      const match = entries.find((e) => !e.is_dir && e.rel_path === savedState.selectedRel) || null;
+      setSelected(match);
+    }
+    // Restore scroll position after the grid renders
+    const t = setTimeout(() => {
+      if (gridRef.current && typeof savedState?.scrollTop === "number") {
+        gridRef.current.scrollTop = savedState.scrollTop!;
+      }
+    }, 0);
+    return () => clearTimeout(t);
+  }, [entries, savedState?.selectedRel, savedState?.scrollTop]);
+
+  /* ----- Bubble state up whenever root/path/selection change ----- */
+  useEffect(() => {
+    onSavedStateChange({
+      root: root || "",
+      path,
+      selectedRel: selected?.rel_path,
+      scrollTop: gridRef.current?.scrollTop || 0,
+    });
+    // Parent callback is memoized, so this runs only when root/path/selected change.
+  }, [root, path, selected, onSavedStateChange]);
+
+  /* ----- Throttle scroll-to-parent updates via rAF ----- */
+  function onGridScroll() {
+    if (scrollRAF.current) cancelAnimationFrame(scrollRAF.current);
+    scrollRAF.current = requestAnimationFrame(() => {
+      onSavedStateChange({
+        root: root || "",
+        path,
+        selectedRel: selected?.rel_path,
+        scrollTop: gridRef.current?.scrollTop || 0,
+      });
+    });
+  }
+  useEffect(() => {
+    return () => {
+      if (scrollRAF.current) cancelAnimationFrame(scrollRAF.current);
+    };
+  }, []);
+
+  /* ----- Breadcrumbs ----- */
   const crumbs = useMemo(() => {
     const parts = path ? path.split("/").filter(Boolean) : [];
     const acc: { name: string; p: string }[] = [];
@@ -168,7 +245,7 @@ export default function StagingView({ theme }: { theme: Theme }) {
     return acc;
   }, [path]);
 
-  // Nav helpers
+  /* ----- Nav helpers ----- */
   function goUp() {
     if (!path) return;
     const idx = path.lastIndexOf("/");
@@ -179,10 +256,12 @@ export default function StagingView({ theme }: { theme: Theme }) {
     setPath(entry.rel_path);
   }
 
-  // Right-pane preview URL
+  /* ----- Right-pane preview URL ----- */
   const previewSrc = useMemo(() => {
     if (!selectedPreview) return null;
-    if (selectedPreview.ext && looksLikeVideo(selectedPreview.ext)) {
+
+    // Pass the full filename to looksLikeVideo (fixes brittle ext handling)
+    if (looksLikeVideo(selectedPreview.name)) {
       return { kind: "video" as const, url: selectedPreview.media_url ?? "" };
     }
     if (selectedPreview.thumb_url) {
@@ -193,6 +272,95 @@ export default function StagingView({ theme }: { theme: Theme }) {
     }
     return null;
   }, [selectedPreview]);
+
+  /* ----- Move-to-Review split button state & helpers ----- */
+
+  // Scopes the user can run
+  type MoveMode = "folder" | "folderRecursive" | "root" | "allRoots" | "selected";
+
+  // Remember last-used mode; default to "folder"
+  const [moveMode, setMoveMode] = useState<MoveMode>("folder");
+  // Optional: let user toggle dry-run from the menu
+  const [dryRun, setDryRun] = useState<boolean>(true);
+  // Controls the tiny dropdown
+  const [moveMenuOpen, setMoveMenuOpen] = useState(false);
+  const moveMenuRef = useRef<HTMLDivElement | null>(null);
+
+  // Close the menu when clicking outside
+  useEffect(() => {
+    function onDocDown(e: MouseEvent) {
+      if (!moveMenuRef.current) return;
+      if (!moveMenuRef.current.contains(e.target as Node)) setMoveMenuOpen(false);
+    }
+    document.addEventListener("mousedown", onDocDown);
+    return () => document.removeEventListener("mousedown", onDocDown);
+  }, []);
+
+  // Human-readable label for each mode (used in button tooltips)
+  function labelForMode(m: MoveMode): string {
+    switch (m) {
+      case "folder": return "This folder";
+      case "folderRecursive": return "This folder + subfolders";
+      case "root": return `Entire root${root ? ` (${root})` : ""}`;
+      case "allRoots": return "All roots";
+      case "selected": return "Selected item";
+      default: {
+        // Exhaustiveness check (helps future refactors)
+        const _exhaustive: never = m;
+        return String(_exhaustive);
+      }
+    }
+  }
+
+  // Compute whether the primary button should be enabled given current mode
+  const primaryDisabled =
+    (moveMode === "folder" || moveMode === "folderRecursive" || moveMode === "root") ? !root :
+    (moveMode === "selected" ? !selectedPreview : false);
+
+  // Call your backend (currently stubbed) to run ingest with the chosen scope
+  async function runMove(mode?: MoveMode) {
+    const m = mode ?? moveMode;
+
+    // Guard rails
+    if ((m === "folder" || m === "folderRecursive" || m === "root") && !root) {
+      alert("Pick a source first.");
+      return;
+    }
+    if (m === "selected" && !selectedPreview) {
+      alert("Select a file first.");
+      return;
+    }
+
+    // Build a simple payload you can POST to your (future) ingest endpoint
+    const payload: Record<string, unknown> = {
+      mode: m,
+      root: root || null,
+      path: path || "",
+      recursive: m === "folderRecursive" || m === "root",
+      allRoots: m === "allRoots",
+      selectedRel: m === "selected" ? selectedPreview?.rel_path : null,
+      dryRun,
+    };
+
+    // Friendly confirmation (swap to a modal later if desired)
+    const msg =
+      m === "folder" ? `Move: this folder only?\n${root}/${path || ""}`
+      : m === "folderRecursive" ? `Move: this folder + subfolders?\n${root}/${path || ""}`
+      : m === "root" ? `Move entire root "${root}"?`
+      : m === "allRoots" ? "Move ALL configured roots?"
+      : `Move selected item?\n${selectedPreview?.name || ""}`;
+    if (!window.confirm(`${msg}\n\n${dryRun ? "(Dry run)" : "(Write mode)"}`)) return;
+
+    try {
+      // TODO: wire to your backend ingest endpoint
+      console.log("Would POST /api/ingest/run", payload);
+      alert(`Queued ingest:\n${JSON.stringify(payload, null, 2)}`);
+    } catch (e) {
+      alert(`Failed to start ingest: ${toErrorMessage(e)}`);
+    } finally {
+      setMoveMenuOpen(false);
+    }
+  }
 
   return (
     <section
@@ -210,62 +378,234 @@ export default function StagingView({ theme }: { theme: Theme }) {
       }}
     >
       {/* toolbar */}
-      <div style={{ display: "flex", alignItems: "center", gap: 0, flexWrap: "wrap", color: theme.text, transform: "translateY(8px)", width: "100%" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", paddingBottom: 4,}}>
-          <label>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 0,
+          flexWrap: "wrap",
+          color: theme.text,
+          transform: "translateY(8px)",
+          width: "100%",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", paddingBottom: 4 }}>
+          {/* Source select, now styled like Move-to-Review via classes + caret */}
+          <label style={{ position: "relative", display: "inline-block" }}>
             Source:&nbsp;
-            <select
-              value={root}
-              onChange={(e) => { setRoot(e.target.value); setPath(""); }}
-              style={{ background: theme.surface, color: theme.text, border: `1px solid ${theme.border}`, borderRadius: 8, padding: "7px 5px" }}
+            <div
+              style={{
+                position: "relative",
+                display: "inline-block",
+                width: 180, // tweak as needed
+              }}
             >
-              <option value="" disabled>select…</option>
-              {roots.map((r) => <option key={r} value={r}>{r}</option>)}
-            </select>
+              <select
+                className="px-pill px-action px-select"
+                value={root}
+                onChange={(e) => {
+                  setRoot(e.target.value);
+                  setPath(""); // changing source resets path
+                }}
+              >
+                <option value="" disabled>
+                  select…
+                </option>
+                {roots.map((r) => (
+                  <option key={r} value={r}>
+                    {r}
+                  </option>
+                ))}
+              </select>
+
+              {/* caret overlay */}
+              <span className="px-caret">▾</span>
+            </div>
           </label>
-            {/* NEW ACTION BUTTONS */}
-              <button
-                onClick={() => alert("sync triggered")}
-                style={{
-                  padding: "4px 8px",
-                  borderRadius: 8,
-                  border: `1px solid ${theme.border}`,
-                  background: theme.surface,
-                  color: theme.text,
-                  cursor: "pointer",
-                }}
-                title="Sync staging folders (e.g. icloudpd, sdcard, etc)"
-              >
-                🔄 Sync
-              </button>
 
-              <button
-                onClick={() => alert("move to review triggered")}
-                style={{
-                  padding: "4px 8px",
-                  borderRadius: 8,
-                  border: `1px solid ${theme.border}`,
-                  background: theme.surface,
-                  color: theme.text,
-                  cursor: "pointer",
-                }}
-                title="Run ingest to move files into Review and update DB"
-              >
-                📤 Move to Review
-              </button>
+          {/* SYNC */}
+          <button
+            onClick={() => alert("sync triggered")}
+            className="px-pill px-action"
+            style={{ padding: "0 8px" }} // keep height via class, adjust padding only
+            title="Sync staging folders (e.g. icloudpd, sdcard, etc)"
+          >
+            🔄 Sync
+          </button>
 
+          {/* MOVE TO REVIEW: split button with scope menu */}
+          <div ref={moveMenuRef} style={{ position: "relative", display: "inline-flex" }}>
+            {/* Primary (runs last-used scope) */}
+            <button
+              onClick={() => runMove()}
+              disabled={primaryDisabled}
+              className="px-pill px-action px-split-left"
+              style={{
+                padding: "0 10px",
+                cursor: primaryDisabled ? "not-allowed" : "pointer",
+                opacity: primaryDisabled ? 0.6 : 1,
+                background: "var(--bg-card)",
+              }}
+              title={`Run: ${labelForMode(moveMode)}${dryRun ? " (dry run)" : ""}`}
+            >
+              📤 Move to Review
+            </button>
+
+            {/* Caret (opens the menu) */}
+            <button
+              onClick={() => setMoveMenuOpen((v) => !v)}
+              className="px-pill px-action px-split-right"
+              aria-label="Choose scope for Move to Review"
+              title="Choose scope"
+            >
+              ▾
+            </button>
+
+            {/* Dropdown */}
+            {moveMenuOpen && (
+              <div
+                role="menu"
+                style={{
+                  position: "absolute",
+                  top: "calc(100% + 6px)",
+                  left: 0,
+                  minWidth: 260,
+                  background: theme.cardBg,
+                  color: theme.text,
+                  border: `1px solid ${theme.border}`,
+                  borderRadius: 10,
+                  padding: 6,
+                  boxShadow: "0 6px 24px rgba(0,0,0,0.4)",
+                  zIndex: 20,
+                }}
+              >
+                <div style={{ padding: "6px 8px", color: theme.muted, fontSize: 12 }}>Scope</div>
+
+                <button
+                  role="menuitem"
+                  onClick={() => { setMoveMode("folder"); runMove("folder"); }}
+                  disabled={!root}
+                  className="px-pill px-action"
+                  style={{ width: "100%", textAlign: "left", marginBottom: 6, background: "transparent" }}
+                  title="Only the current folder"
+                >
+                  📂 This folder only
+                </button>
+
+                <button
+                  role="menuitem"
+                  onClick={() => { setMoveMode("folderRecursive"); runMove("folderRecursive"); }}
+                  disabled={!root}
+                  className="px-pill px-action"
+                  style={{ width: "100%", textAlign: "left", marginBottom: 6, background: "transparent" }}
+                  title="Current folder and all subfolders"
+                >
+                  🧭 This folder + subfolders
+                </button>
+
+                <button
+                  role="menuitem"
+                  onClick={() => { setMoveMode("root"); runMove("root"); }}
+                  disabled={!root}
+                  className="px-pill px-action"
+                  style={{ width: "100%", textAlign: "left", marginBottom: 6, background: "transparent" }}
+                  title="Everything under the selected root"
+                >
+                  🏷️ Entire root {root ? `(${root})` : ""}
+                </button>
+
+                <button
+                  role="menuitem"
+                  onClick={() => { setMoveMode("allRoots"); runMove("allRoots"); }}
+                  className="px-pill px-action"
+                  style={{ width: "100%", textAlign: "left", marginBottom: 6, background: "transparent" }}
+                  title="Every configured root (icloud, pc, sdcard, …)"
+                >
+                  🌐 All roots
+                </button>
+
+                <button
+                  role="menuitem"
+                  onClick={() => { setMoveMode("selected"); runMove("selected"); }}
+                  disabled={!selectedPreview}
+                  className="px-pill px-action"
+                  style={{ width: "100%", textAlign: "left", marginBottom: 6, background: "transparent" }}
+                  title="Only the selected file"
+                >
+                  🔎 Selected item only
+                </button>
+
+                <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px", marginTop: 4 }}>
+                  <input
+                    id="dry-run"
+                    type="checkbox"
+                    checked={dryRun}
+                    onChange={(e) => setDryRun(e.target.checked)}
+                  />
+                  <label htmlFor="dry-run" style={{ fontSize: 13, color: theme.text, cursor: "pointer" }}>
+                    Dry run
+                  </label>
+                  <div style={{ marginLeft: "auto", color: theme.muted, fontSize: 12 }}>
+                    Last: <em>{labelForMode(moveMode)}</em>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Breadcrumbs + Up */}
           <div style={{ color: theme.muted }}>
             Path:&nbsp;
-            <button onClick={() => setPath("")} style={{ padding: "4px 5px", border: "none", background: "transparent", textDecoration: "underline", cursor: "pointer", color: theme.text }} title="go to root">/</button>
+            <button
+              onClick={() => setPath("")}
+              style={{
+                padding: "4px 8px",
+                border: "none",
+                background: "transparent",
+                textDecoration: "underline",
+                cursor: "pointer",
+                color: theme.text,
+                lineHeight: "28px",
+              }}
+              title="go to root"
+            >
+              /
+            </button>
             {crumbs.map((c) => (
               <span key={c.p}>
                 <span>&nbsp;/&nbsp;</span>
-                <button onClick={() => setPath(c.p)} style={{ padding: "4px 5px", border: "none", background: "transparent", textDecoration: "underline", cursor: "pointer", color: theme.text }} title={`go to ${c.p}`}>{c.name}</button>
+                <button
+                  onClick={() => setPath(c.p)}
+                  style={{
+                    padding: "4px 8px",
+                    border: "none",
+                    background: "transparent",
+                    textDecoration: "underline",
+                    cursor: "pointer",
+                    color: theme.text,
+                    lineHeight: "28px",
+                  }}
+                  title={`go to ${c.p}`}
+                >
+                  {c.name}
+                </button>
               </span>
             ))}
           </div>
 
-          <button onClick={goUp} disabled={!path} style={{ padding: "4px 5px", borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, cursor: path ? "pointer" : "not-allowed", opacity: path ? 1 : 0.5 }}>
+          <button
+            onClick={goUp}
+            disabled={!path}
+            className="px-pill px-action"
+            style={{
+              padding: "0 8px",
+              cursor: path ? "pointer" : "not-allowed",
+              opacity: path ? 1 : 0.5,
+              background: "var(--bg-card)",
+            }}
+            title="Up one level"
+            aria-label="Up one level"
+          >
             ↑
           </button>
         </div>
@@ -277,9 +617,21 @@ export default function StagingView({ theme }: { theme: Theme }) {
             { icon: "📷", label: "Images", val: stats?.images },
             { icon: "🎞️", label: "Videos", val: stats?.videos },
             { icon: "📁", label: "Folders", val: stats?.dirs },
-            { icon: "🧩", label: "Other",  val: stats?.other },
+            { icon: "🧩", label: "Other", val: stats?.other },
           ].map((p) => (
-            <div key={p.label} title={p.label} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 8px", borderRadius: 999, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12, lineHeight: 1 }}>
+            <div
+              key={p.label}
+              title={p.label}
+              className="px-pill"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+                fontSize: 12,
+                lineHeight: 1,
+                background: "var(--bg-surface)",
+              }}
+            >
               <span aria-hidden>{p.icon}</span>
               <strong style={{ fontWeight: 600 }}>{p.label}</strong>
               <span style={{ color: theme.muted }}>·</span>
@@ -290,9 +642,11 @@ export default function StagingView({ theme }: { theme: Theme }) {
       </div>
 
       {/* content: grid + preview */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr minmax(360px, 40%)", gap: 8, minHeight: 0, paddingBottom: 0, }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr minmax(360px, 40%)", gap: 8, minHeight: 0, paddingBottom: 0 }}>
         {/* LEFT: grid */}
         <div
+          ref={gridRef} // capture scroll for persistence
+          onScroll={onGridScroll}
           style={{
             display: "grid",
             gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
@@ -311,11 +665,28 @@ export default function StagingView({ theme }: { theme: Theme }) {
         >
           {error && <div style={{ gridColumn: "1 / -1", color: "#fca5a5" }}>{error}</div>}
 
-          {!error && entries.length === 0 && (
-            <div style={{ gridColumn: "1 / -1", display: "grid", placeItems: "center", height: "100%", color: theme.muted, textAlign: "center" }}>
+          {!error && (!root || entries.length === 0) && (
+            <div
+              style={{
+                gridColumn: "1 / -1",
+                display: "grid",
+                placeItems: "center",
+                height: "100%",
+                color: theme.muted,
+                textAlign: "center",
+              }}
+            >
               <div>
                 <div style={{ fontSize: 28, marginBottom: 6 }}>🗂️</div>
-                <div>No items here. <strong>Select a folder</strong> to view files.</div>
+                {root ? (
+                  <div>
+                    No items here. <strong>Select a folder</strong> to view files.
+                  </div>
+                ) : (
+                  <div>
+                    <strong>Select a source</strong> to begin.
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -343,18 +714,48 @@ export default function StagingView({ theme }: { theme: Theme }) {
                 title={e.rel_path}
               >
                 {isDir ? (
-                  <div style={{ height: 140, borderRadius: 8, border: `1px dashed ${theme.border}`, display: "grid", placeItems: "center", background: "#0e1014", fontSize: 32, color: theme.text }}>
+                  <div
+                    style={{
+                      height: 140,
+                      borderRadius: 8,
+                      border: `1px dashed ${theme.border}`,
+                      display: "grid",
+                      placeItems: "center",
+                      background: "#0e1014",
+                      fontSize: 32,
+                      color: theme.text,
+                    }}
+                  >
                     📁
                   </div>
                 ) : e.media_url ? (
                   <Thumb src={(e.thumb_url ?? e.media_url)!} alt={e.name} height={140} fit="cover" />
                 ) : (
-                  <div style={{ height: 140, borderRadius: 8, border: `1px dashed ${theme.border}`, display: "grid", placeItems: "center", background: "#0e1014", color: theme.muted, fontSize: 12 }}>
+                  <div
+                    style={{
+                      height: 140,
+                      borderRadius: 8,
+                      border: `1px dashed ${theme.border}`,
+                      display: "grid",
+                      placeItems: "center",
+                      background: "#0e1014",
+                      color: theme.muted,
+                      fontSize: 12,
+                    }}
+                  >
                     preview unavailable
                   </div>
                 )}
 
-                <div style={{ fontSize: 12, color: theme.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: theme.text,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
                   {e.name}
                 </div>
                 <div className="muted" style={{ fontSize: 11, color: theme.muted }}>
@@ -413,16 +814,14 @@ export default function StagingView({ theme }: { theme: Theme }) {
           <div>
             <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
               <button
-                onClick={() => setExifExpanded(v => !v)}
+                onClick={() => setExifExpanded((v) => !v)}
                 disabled={!selectedPreview}
+                className="px-pill px-action"
                 style={{
-                  padding: "6px 10px",
-                  borderRadius: 8,
-                  border: `1px solid ${theme.border}`,
-                  background: theme.cardBg,
-                  color: theme.text,
+                  padding: "0 10px",
                   cursor: selectedPreview ? "pointer" : "not-allowed",
                   opacity: selectedPreview ? 1 : 0.5,
+                  background: "var(--bg-card)",
                 }}
                 title={exifExpanded ? "Hide additional EXIF fields" : "Show all EXIF fields"}
               >
@@ -434,9 +833,9 @@ export default function StagingView({ theme }: { theme: Theme }) {
               <button
                 disabled={!selectedPreview}
                 onClick={() => selectedPreview && alert(`Delete: ${selectedPreview.name}`)}
+                className="px-pill"
                 style={{
-                  padding: "6px 10px",
-                  borderRadius: 8,
+                  padding: "0 10px",
                   border: "1px solid #7f1d1d",
                   background: "#2a0b0b",
                   color: "#ef4444",
@@ -470,12 +869,20 @@ export default function StagingView({ theme }: { theme: Theme }) {
                 (() => {
                   const entries = Object.entries(exifData) as Array<[string, ExifValue]>;
                   const primaryKeys = new Set([
-                    "Basic:Filename", "Basic:Modified", "Basic:Size", "Basic:Path",
-                    "EXIF:DateTimeOriginal", "EXIF:CreateDate", "QuickTime:CreateDate",
-                    "EXIF:Make", "EXIF:Model", "EXIF:GPSLatitude", "EXIF:GPSLongitude",
+                    "Basic:Filename",
+                    "Basic:Modified",
+                    "Basic:Size",
+                    "Basic:Path",
+                    "EXIF:DateTimeOriginal",
+                    "EXIF:CreateDate",
+                    "QuickTime:CreateDate",
+                    "EXIF:Make",
+                    "EXIF:Model",
+                    "EXIF:GPSLatitude",
+                    "EXIF:GPSLongitude",
                   ]);
                   const primary = entries.filter(([k]) => primaryKeys.has(k));
-                  const visible = exifExpanded ? entries : (primary.length ? primary : entries.slice(0, 8));
+                  const visible = exifExpanded ? entries : primary.length ? primary : entries.slice(0, 8);
                   const hiddenCount = exifExpanded ? 0 : Math.max(entries.length - visible.length, 0);
 
                   return (

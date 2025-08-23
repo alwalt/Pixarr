@@ -1,3 +1,4 @@
+/* --- existing Vite starter styles (kept for now) --- */
 #root {
   max-width: 1280px;
   margin: 0 auto;
@@ -19,12 +20,8 @@
 }
 
 @keyframes logo-spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 @media (prefers-reduced-motion: no-preference) {
@@ -33,10 +30,62 @@
   }
 }
 
-.card {
-  padding: 2em;
+.card { padding: 2em; }
+.read-the-docs { color: #888; }
+
+/* --- Pixarr shared UI primitives --- */
+
+/* Base pill (buttons, badges, selects share this) */
+.px-pill {
+  height: 36px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 36px;
+  box-sizing: border-box;
 }
 
-.read-the-docs {
-  color: #888;
+/* Interactions */
+.px-action {
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease, border-color .15s ease, opacity .15s ease;
 }
+.px-action:hover,
+.px-action:focus {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent-border);
+  outline: none;
+}
+
+/* Split button utilities */
+.px-split-left  { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.px-split-right { border-top-left-radius: 0;  border-bottom-left-radius: 0;  border-left: none; }
+
+/* Select styling (paired with caret overlay) */
+.px-select {
+  appearance: none; -webkit-appearance: none; -moz-appearance: none;
+  width: 100%;
+  padding: 0 32px 0 10px; /* space for caret */
+  background: var(--bg-card);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.px-select:disabled { cursor: not-allowed; opacity: .6; }
+
+.px-caret {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+/* Optional: utility for muted text */
+.muted { color: var(--muted); }

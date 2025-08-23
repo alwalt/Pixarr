@@ -65,3 +65,6 @@ Thumbs.db
 .vscode/
 .idea/
 data/thumb-cache/
+
+# icloud
+data/icloud-cookies/*

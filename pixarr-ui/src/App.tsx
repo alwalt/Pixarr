@@ -1,12 +1,10 @@
 // src/App.tsx
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import StagingView from "./components/StagingView";
 import ReviewView from "./components/ReviewView";
-// If you haven't created these yet, keep the stubs below or add real files:
 import QuarantineView from "./components/QuarantineView";
 import LibraryView from "./components/LibraryView";
 import "./App.css";
-
 
 /** Dark theme tokens */
 const theme = {
@@ -32,18 +30,114 @@ const RAIL_W = BTN_SIZE + RAIL_PAD * 2 + RAIL_BORDER + RAIL_EXTRA;
 type Tab = "staging" | "review" | "quarantine" | "library";
 type AsideMode = "about" | "settings";
 
-export default function App() {
-  const [tab, setTab] = useState<Tab>("staging");
+/**
+ * Persist helpers — safe sessionStorage with lint- and target-friendly catch blocks.
+ * No empty catches (eslint no-empty) and no unused vars.
+ */
+const ss = {
+  getString(key: string): string | null {
+    try {
+      return typeof window !== "undefined" ? window.sessionStorage.getItem(key) : null;
+    } catch (e) {
+      void e; // storage may be unavailable (private mode/quota/SSR)
+      return null;
+    }
+  },
+  getJSON<T>(key: string): T | null {
+    try {
+      const raw = typeof window !== "undefined" ? window.sessionStorage.getItem(key) : null;
+      return raw ? (JSON.parse(raw) as T) : null;
+    } catch (e) {
+      void e; // invalid JSON or storage unavailable
+      return null;
+    }
+  },
+  set(key: string, value: unknown): void {
+    try {
+      if (typeof window === "undefined") return;
+      const v = typeof value === "string" ? value : JSON.stringify(value);
+      window.sessionStorage.setItem(key, v);
+    } catch (e) {
+      void e; // ignore persist errors; non-critical
+    }
+  },
+};
 
-  // Collapsible aside
-  const [asideOpen, setAsideOpen] = useState<boolean>(true);
-  const [asideMode, setAsideMode] = useState<AsideMode>("about");
+/** What we remember for Staging so your place is preserved across tab switches. */
+export type StagingSavedState = {
+  root: string;
+  path: string;
+  selectedRel?: string;
+  scrollTop?: number;
+};
 
-  const appCols = useMemo(
-    () => (asideOpen ? "3fr 1fr" : `1fr ${RAIL_W}px`),
-    [asideOpen]
+const defaultStaging: StagingSavedState = {
+  root: "",
+  path: "",
+  selectedRel: undefined,
+  scrollTop: 0,
+};
+
+/** Shallow compare to avoid no-op state writes (prevents unnecessary rerenders). */
+function shallowEqualStaging(a: StagingSavedState, b: StagingSavedState): boolean {
+  return (
+    a.root === b.root &&
+    a.path === b.path &&
+    a.selectedRel === b.selectedRel &&
+    (a.scrollTop ?? 0) === (b.scrollTop ?? 0)
   );
+}
 
+export default function App() {
+  // Persist active tab so returning users land where they left off
+  const [tab, setTab] = useState<Tab>(() => {
+    const saved = ss.getString("pixarr.tab") as Tab | null;
+    return saved ?? "staging";
+  });
+
+  // Collapsible aside (persist open state + mode) — with safe JSON parse
+  const [asideOpen, setAsideOpen] = useState<boolean>(() => {
+    const saved = ss.getString("pixarr.asideOpen");
+    if (!saved) return true;
+    try {
+      return JSON.parse(saved) as boolean;
+    } catch {
+      return true;
+    }
+  });
+  const [asideMode, setAsideMode] = useState<AsideMode>(() => {
+    const saved = ss.getString("pixarr.asideMode") as AsideMode | null;
+    return saved ?? "about";
+  });
+
+  // Grid column layout reacts to aside open/closed
+  const appCols = useMemo(() => (asideOpen ? "3fr 1fr" : `1fr ${RAIL_W}px`), [asideOpen]);
+
+  // Lifted Staging state so it survives unmounts when you switch tabs
+  const [stagingState, setStagingState] = useState<StagingSavedState>(() => {
+    return ss.getJSON<StagingSavedState>("pixarr.staging") ?? defaultStaging;
+  });
+
+  /** Stable callback to receive state updates from StagingView. */
+  const onStagingStateChange = useCallback((next: StagingSavedState) => {
+    setStagingState((prev) => {
+      if (prev && shallowEqualStaging(prev, next)) return prev; // no change → no rerender
+      ss.set("pixarr.staging", next);
+      return next;
+    });
+  }, []);
+
+  // Persist small UI bits
+  useEffect(() => {
+    ss.set("pixarr.tab", tab);
+  }, [tab]);
+
+  useEffect(() => {
+    ss.set("pixarr.asideOpen", JSON.stringify(asideOpen));
+    ss.set("pixarr.asideMode", asideMode);
+  }, [asideOpen, asideMode]);
+
+  /** Tab button factory (kept inline for brevity; can be converted to classes later) */
   const tabBtn = (t: Tab, label: string) => {
     const active = tab === t;
     return (
@@ -66,7 +160,7 @@ export default function App() {
   };
 
   const railItems = [
-    { mode: "about" as const,    icon: "🛈", label: "About / Instructions" },
+    { mode: "about" as const, icon: "🛈", label: "About / Instructions" },
     { mode: "settings" as const, icon: "⚙️", label: "Settings" },
   ];
 
@@ -97,6 +191,17 @@ export default function App() {
         background: theme.appBg,
         color: theme.text,
         paddingBottom: 6,
+
+        // Publish theme as CSS variables for child class-based styles
+        ["--bg-app" as any]: theme.appBg,
+        ["--bg-header" as any]: theme.headerBg,
+        ["--bg-surface" as any]: theme.surface,
+        ["--bg-card" as any]: theme.cardBg,
+        ["--border" as any]: theme.border,
+        ["--text" as any]: theme.text,
+        ["--muted" as any]: theme.muted,
+        ["--accent" as any]: theme.accent,
+        ["--accent-border" as any]: theme.accentBorder,
       }}
     >
       {/* HEADER (left column) */}
@@ -115,7 +220,7 @@ export default function App() {
         }}
       >
         <h1 style={{ margin: "0 0 4px 0", color: theme.text, textAlign: "left" }}>Pixarr</h1>
-        <p className="muted" style={{ margin: 0, color: theme.muted , textAlign: "left"}}>
+        <p className="muted" style={{ margin: 0, color: theme.muted, textAlign: "left" }}>
           automatic importer for personal photos and videos: watch sources, normalize metadata,
           dedupe, and organize.
         </p>
@@ -139,7 +244,11 @@ export default function App() {
         }}
       >
         {tab === "staging" ? (
-          <StagingView theme={theme} />
+          <StagingView
+            theme={theme}
+            savedState={stagingState}                 // restore root/path/selection/scroll
+            onSavedStateChange={onStagingStateChange} // keep state in sync as user navigates
+          />
         ) : tab === "review" ? (
           <ReviewView theme={theme} />
         ) : tab === "quarantine" ? (
@@ -241,12 +350,9 @@ export default function App() {
                 paddingBottom: 8,
               }}
             >
-              <h2 style={{ margin: 0, fontSize: 16, flex: 1 }}>
-                {asideMode === "about" ? (
-                  <div style={{ color: theme.muted }}><p>About / instructions…</p></div>
-                ) : (
-                  <div style={{ color: theme.muted }}><p>Settings go here…</p></div>
-                )}
+              {/* Accessible heading id matches aria-labelledby */}
+              <h2 id="aside-title" style={{ margin: 0, fontSize: 16, flex: 1, color: theme.text }}>
+                {asideMode === "about" ? "About / instructions" : "Settings"}
               </h2>
             </div>
 
@@ -276,5 +382,3 @@ export default function App() {
     </div>
   );
 }
-
-
