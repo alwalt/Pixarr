@@ -1,9 +1,18 @@
 // src/components/StagingView.tsx
+// Staging browser (sources → folders → media) with right‑hand preview + EXIF.
+// Notes:
+// - Keeps the UI snappy and stateful (root/path/selection/scroll persisted in App).
+// - Fetches roots, directory entries, and directory stats from the FastAPI backend.
+// - Sync button calls POST /api/staging/sync/icloud and, on success, triggers a light refresh.
+
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { StagingEntry } from "../types";
 import Thumb from "./Thumb";
 
-/* ========= Types ========= */
+/* ========================================================================== */
+/*  Types & constants                                                         */
+/* ========================================================================== */
+
 type Theme = {
   appBg: string; headerBg: string; surface: string; cardBg: string;
   border: string; text: string; muted: string; accent: string; accentBorder: string;
@@ -27,7 +36,9 @@ export type StagingSavedState = {
 
 const API_BASE = "http://localhost:8000";
 
-/* ========= Helpers ========= */
+/* ========================================================================== */
+/*  Small helpers                                                             */
+/* ========================================================================== */
 
 /** Decide if extension is a video; used for preview rendering. */
 function looksLikeVideo(name: string): boolean {
@@ -54,7 +65,9 @@ function toErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/* ========= Component ========= */
+/* ========================================================================== */
+/*  Component                                                                 */
+/* ========================================================================== */
 
 export default function StagingView({
   theme,
@@ -67,31 +80,40 @@ export default function StagingView({
   /** Call this whenever root/path/selection/scroll changes */
   onSavedStateChange: (s: StagingSavedState) => void;
 }) {
-  /* ----- Routing (lifted defaults restored from savedState) ----- */
+  /* ------------------------------------------------------------------------ */
+  /*  Local state (routing, data, selection)                                  */
+  /* ------------------------------------------------------------------------ */
+
+  // Source roots; do NOT auto-pick a root (respect savedState or "").
   const [roots, setRoots] = useState<RootName[]>([]);
-  // IMPORTANT: do not auto-select a root by default. Start with saved value or "".
   const [root, setRoot] = useState<RootName | "">(savedState.root || "");
   const [path, setPath] = useState<string>(savedState.path || "");
 
-  /* ----- Data + selection ----- */
+  // Directory listing + selection
   const [entries, setEntries] = useState<StagingEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<StagingEntry | null>(null);
 
-  /* ----- Stats ----- */
+  // Directory stats
   const [stats, setStats] = useState<StagingStats | null>(null);
   const [statsError, setStatsError] = useState<string | null>(null);
 
-  /* ----- EXIF UI ----- */
+  // EXIF panel
   const [exifExpanded, setExifExpanded] = useState(false);
   const [exifData, setExifData] = useState<ExifData | null>(null);
   const [exifErr, setExifErr] = useState<string | null>(null);
 
-  /* ----- Scroll persistence ----- */
+  // Scroll persistence
   const gridRef = useRef<HTMLDivElement | null>(null);
   const scrollRAF = useRef<number | null>(null);
 
-  /* ----- Selected → preview DTO ----- */
+  // Lightweight “refresh” tick (used after Sync completes to refetch list/stats)
+  const [refreshTick, setRefreshTick] = useState(0);
+
+  /* ------------------------------------------------------------------------ */
+  /*  Derived selection → preview DTO                                         */
+  /* ------------------------------------------------------------------------ */
+
   const selectedPreview = useMemo(() => {
     if (!selected || selected.is_dir) return null;
     return {
@@ -104,18 +126,24 @@ export default function StagingView({
     };
   }, [selected]);
 
-  /* ----- Roots fetch (no auto-pick) ----- */
+  /* ------------------------------------------------------------------------ */
+  /*  Fetch: roots                                                            */
+  /* ------------------------------------------------------------------------ */
+
   useEffect(() => {
     fetch(`${API_BASE}/api/staging/roots`)
       .then((r) => r.json())
       .then((list: RootName[]) => {
         setRoots(list);
-        // DO NOT set a default root here. Keep current root as-is.
+        // Note: do NOT auto-select a root here.
       })
       .catch((e) => setError(`failed to load roots: ${String(e)}`));
   }, []);
 
-  /* ----- Entries fetch (depends on root/path) ----- */
+  /* ------------------------------------------------------------------------ */
+  /*  Fetch: entries (depends on root, path, refreshTick)                     */
+  /* ------------------------------------------------------------------------ */
+
   useEffect(() => {
     if (!root) return; // require explicit selection
     const params = new URLSearchParams();
@@ -134,9 +162,12 @@ export default function StagingView({
         setExifExpanded(false);
       })
       .catch((e) => setError(`failed to list: ${String(e)}`));
-  }, [root, path]);
+  }, [root, path, refreshTick]);
 
-  /* ----- Stats fetch ----- */
+  /* ------------------------------------------------------------------------ */
+  /*  Fetch: stats (same dependencies as entries)                             */
+  /* ------------------------------------------------------------------------ */
+
   useEffect(() => {
     if (!root) return;
     const params = new URLSearchParams();
@@ -153,9 +184,12 @@ export default function StagingView({
         setStatsError(null);
       })
       .catch((e) => setStatsError(`failed to load stats: ${String(e)}`));
-  }, [root, path]);
+  }, [root, path, refreshTick]);
 
-  /* ----- EXIF fetch (from backend) ----- */
+  /* ------------------------------------------------------------------------ */
+  /*  Fetch: EXIF (depends on current selection)                              */
+  /* ------------------------------------------------------------------------ */
+
   useEffect(() => {
     let cancelled = false;
 
@@ -188,9 +222,12 @@ export default function StagingView({
     return () => { cancelled = true; };
   }, [selectedPreview, root]);
 
-  /* ----- Restore selection + scroll after entries load ----- */
+  /* ------------------------------------------------------------------------ */
+  /*  Restore selection + scroll after entries load                            */
+  /* ------------------------------------------------------------------------ */
+
   useEffect(() => {
-    // Attempt to restore the previously selected item by rel_path
+    // Try to restore the previously selected item by rel_path
     if (savedState?.selectedRel && entries.length) {
       const match = entries.find((e) => !e.is_dir && e.rel_path === savedState.selectedRel) || null;
       setSelected(match);
@@ -204,7 +241,10 @@ export default function StagingView({
     return () => clearTimeout(t);
   }, [entries, savedState?.selectedRel, savedState?.scrollTop]);
 
-  /* ----- Bubble state up whenever root/path/selection change ----- */
+  /* ------------------------------------------------------------------------ */
+  /*  Bubble state up whenever root/path/selection change                      */
+  /* ------------------------------------------------------------------------ */
+
   useEffect(() => {
     onSavedStateChange({
       root: root || "",
@@ -212,10 +252,12 @@ export default function StagingView({
       selectedRel: selected?.rel_path,
       scrollTop: gridRef.current?.scrollTop || 0,
     });
-    // Parent callback is memoized, so this runs only when root/path/selected change.
   }, [root, path, selected, onSavedStateChange]);
 
-  /* ----- Throttle scroll-to-parent updates via rAF ----- */
+  /* ------------------------------------------------------------------------ */
+  /*  Throttle scroll-to-parent updates via rAF                                */
+  /* ------------------------------------------------------------------------ */
+
   function onGridScroll() {
     if (scrollRAF.current) cancelAnimationFrame(scrollRAF.current);
     scrollRAF.current = requestAnimationFrame(() => {
@@ -233,7 +275,10 @@ export default function StagingView({
     };
   }, []);
 
-  /* ----- Breadcrumbs ----- */
+  /* ------------------------------------------------------------------------ */
+  /*  Breadcrumbs + simple nav helpers                                         */
+  /* ------------------------------------------------------------------------ */
+
   const crumbs = useMemo(() => {
     const parts = path ? path.split("/").filter(Boolean) : [];
     const acc: { name: string; p: string }[] = [];
@@ -245,7 +290,6 @@ export default function StagingView({
     return acc;
   }, [path]);
 
-  /* ----- Nav helpers ----- */
   function goUp() {
     if (!path) return;
     const idx = path.lastIndexOf("/");
@@ -256,7 +300,10 @@ export default function StagingView({
     setPath(entry.rel_path);
   }
 
-  /* ----- Right-pane preview URL ----- */
+  /* ------------------------------------------------------------------------ */
+  /*  Right‑pane preview URL                                                   */
+  /* ------------------------------------------------------------------------ */
+
   const previewSrc = useMemo(() => {
     if (!selectedPreview) return null;
 
@@ -273,16 +320,13 @@ export default function StagingView({
     return null;
   }, [selectedPreview]);
 
-  /* ----- Move-to-Review split button state & helpers ----- */
+  /* ------------------------------------------------------------------------ */
+  /*  Move-to-Review split button (UI only — backend TBD)                      */
+  /* ------------------------------------------------------------------------ */
 
-  // Scopes the user can run
   type MoveMode = "folder" | "folderRecursive" | "root" | "allRoots" | "selected";
-
-  // Remember last-used mode; default to "folder"
-  const [moveMode, setMoveMode] = useState<MoveMode>("folder");
-  // Optional: let user toggle dry-run from the menu
+  const [moveMode, setMoveMode] = useState<MoveMode>("folder"); // remember last-used
   const [dryRun, setDryRun] = useState<boolean>(true);
-  // Controls the tiny dropdown
   const [moveMenuOpen, setMoveMenuOpen] = useState(false);
   const moveMenuRef = useRef<HTMLDivElement | null>(null);
 
@@ -296,7 +340,6 @@ export default function StagingView({
     return () => document.removeEventListener("mousedown", onDocDown);
   }, []);
 
-  // Human-readable label for each mode (used in button tooltips)
   function labelForMode(m: MoveMode): string {
     switch (m) {
       case "folder": return "This folder";
@@ -305,19 +348,16 @@ export default function StagingView({
       case "allRoots": return "All roots";
       case "selected": return "Selected item";
       default: {
-        // Exhaustiveness check (helps future refactors)
         const _exhaustive: never = m;
         return String(_exhaustive);
       }
     }
   }
 
-  // Compute whether the primary button should be enabled given current mode
   const primaryDisabled =
     (moveMode === "folder" || moveMode === "folderRecursive" || moveMode === "root") ? !root :
     (moveMode === "selected" ? !selectedPreview : false);
 
-  // Call your backend (currently stubbed) to run ingest with the chosen scope
   async function runMove(mode?: MoveMode) {
     const m = mode ?? moveMode;
 
@@ -331,7 +371,7 @@ export default function StagingView({
       return;
     }
 
-    // Build a simple payload you can POST to your (future) ingest endpoint
+    // Payload you’ll POST when backend is ready
     const payload: Record<string, unknown> = {
       mode: m,
       root: root || null,
@@ -342,13 +382,13 @@ export default function StagingView({
       dryRun,
     };
 
-    // Friendly confirmation (swap to a modal later if desired)
     const msg =
       m === "folder" ? `Move: this folder only?\n${root}/${path || ""}`
       : m === "folderRecursive" ? `Move: this folder + subfolders?\n${root}/${path || ""}`
       : m === "root" ? `Move entire root "${root}"?`
       : m === "allRoots" ? "Move ALL configured roots?"
       : `Move selected item?\n${selectedPreview?.name || ""}`;
+
     if (!window.confirm(`${msg}\n\n${dryRun ? "(Dry run)" : "(Write mode)"}`)) return;
 
     try {
@@ -361,6 +401,41 @@ export default function StagingView({
       setMoveMenuOpen(false);
     }
   }
+
+  /* ------------------------------------------------------------------------ */
+  /*  Sync button → call backend icloud sync (single-run lock on server)       */
+  /* ------------------------------------------------------------------------ */
+
+  async function runSync() {
+    try {
+      const res = await fetch(`${API_BASE}/api/staging/sync/icloud`, { method: "POST" });
+      const data = await res.json();
+
+      if (data.status === "busy") {
+        alert("Sync is already running — please wait.");
+        return;
+      }
+      if (data.status === "error") {
+        alert(`Config error:\n${data.msg}`);
+        return;
+      }
+
+      if (data.exit_code === 0) {
+        alert("iCloud sync completed!");
+        // Nudge list/stats to refresh (especially helpful for icloud root)
+        setRefreshTick((t) => t + 1);
+      } else {
+        const msg = data.stderr || data.stdout || "No output";
+        alert(`Sync failed (code ${data.exit_code}):\n${msg}`);
+      }
+    } catch (e) {
+      alert(`Failed to trigger sync: ${String(e)}`);
+    }
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /*  Render                                                                   */
+  /* ------------------------------------------------------------------------ */
 
   return (
     <section
@@ -377,7 +452,7 @@ export default function StagingView({
         color: theme.text,
       }}
     >
-      {/* toolbar */}
+      {/* =============================== Toolbar ============================== */}
       <div
         style={{
           display: "flex",
@@ -390,16 +465,10 @@ export default function StagingView({
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", paddingBottom: 4 }}>
-          {/* Source select, now styled like Move-to-Review via classes + caret */}
+          {/* Source select (styled like action buttons) */}
           <label style={{ position: "relative", display: "inline-block" }}>
             Source:&nbsp;
-            <div
-              style={{
-                position: "relative",
-                display: "inline-block",
-                width: 180, // tweak as needed
-              }}
-            >
+            <div style={{ position: "relative", display: "inline-block", width: 180 }}>
               <select
                 className="px-pill px-action px-select"
                 value={root}
@@ -408,16 +477,11 @@ export default function StagingView({
                   setPath(""); // changing source resets path
                 }}
               >
-                <option value="" disabled>
-                  select…
-                </option>
+                <option value="" disabled>select…</option>
                 {roots.map((r) => (
-                  <option key={r} value={r}>
-                    {r}
-                  </option>
+                  <option key={r} value={r}>{r}</option>
                 ))}
               </select>
-
               {/* caret overlay */}
               <span className="px-caret">▾</span>
             </div>
@@ -425,10 +489,10 @@ export default function StagingView({
 
           {/* SYNC */}
           <button
-            onClick={() => alert("sync triggered")}
+            onClick={runSync}
             className="px-pill px-action"
             style={{ padding: "0 8px" }} // keep height via class, adjust padding only
-            title="Sync staging folders (e.g. icloudpd, sdcard, etc)"
+            title="Sync staging folders (icloudpd)"
           >
             🔄 Sync
           </button>
@@ -641,7 +705,7 @@ export default function StagingView({
         </div>
       </div>
 
-      {/* content: grid + preview */}
+      {/* ======================== Content: grid + preview ===================== */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr minmax(360px, 40%)", gap: 8, minHeight: 0, paddingBottom: 0 }}>
         {/* LEFT: grid */}
         <div
