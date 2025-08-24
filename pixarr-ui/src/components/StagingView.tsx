@@ -1,9 +1,10 @@
 // src/components/StagingView.tsx
-// Staging browser (sources → folders → media) with right‑hand preview + EXIF.
+// Staging browser (sources → folders → media) with right-hand preview + EXIF.
 // Notes:
 // - Keeps the UI snappy and stateful (root/path/selection/scroll persisted in App).
 // - Fetches roots, directory entries, and directory stats from the FastAPI backend.
 // - Sync button calls POST /api/staging/sync/icloud and, on success, triggers a light refresh.
+// Assisted by ChatGPT (GPT-5 Thinking).
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { StagingEntry } from "../types";
@@ -65,7 +66,7 @@ function toErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** Convert raw bytes to a human‑readable string (e.g. "2.4 MB"). */
+/** Convert raw bytes to a human-readable string (e.g. "2.4 MB"). */
 function formatBytes(bytes?: number | null): string {
   if (bytes == null || isNaN(bytes as number)) return "";
   if (bytes === 0) return "0 B";
@@ -73,6 +74,125 @@ function formatBytes(bytes?: number | null): string {
   const i = Math.floor(Math.log(bytes as number) / Math.log(1024));
   const val = (bytes as number) / Math.pow(1024, i);
   return `${val.toFixed(1)} ${units[i]}`;
+}
+
+/** Return the first non-empty value from a list of EXIF keys. */
+function pickFirst(meta: Record<string, ExifValue> | null, keys: string[]): ExifValue {
+  if (!meta) return null;
+  for (const k of keys) {
+    const v = meta[k];
+    if (v !== null && v !== undefined && String(v).trim() !== "") return v;
+  }
+  return null;
+}
+
+/** Parse numbers safely from varied EXIF strings. */
+function numish(v: ExifValue): number | null {
+  if (v == null) return null;
+  if (typeof v === "number") return isFinite(v) ? v : null;
+  const n = parseFloat(String(v).replace(/[^\d.\-+]/g, ""));
+  return isFinite(n) ? n : null;
+}
+
+/** Try multiple EXIF/QuickTime/Composite keys to extract GPS. */
+function extractGps(meta: ExifData | null): { lat: number; lon: number } | null {
+  if (!meta) return null;
+
+  const pairs: Array<[string, string]> = [
+    ["EXIF:GPSLatitude", "EXIF:GPSLongitude"],
+    ["Composite:GPSLatitude", "Composite:GPSLongitude"],
+    ["QuickTime:GPSLatitude", "QuickTime:GPSLongitude"],
+    ["XMP:GPSLatitude", "XMP:GPSLongitude"],
+  ];
+  for (const [laKey, loKey] of pairs) {
+    const lat = numish(meta[laKey]);
+    const lon = numish(meta[loKey]);
+    if (lat != null && lon != null) {
+      if (Math.abs(lat) < 1e-6 && Math.abs(lon) < 1e-6) return null; // treat 0,0 as missing
+      return { lat, lon };
+    }
+  }
+
+  // Single-field variants like "37.3317, -122.0307"
+  const combo = (meta["Composite:GPSPosition"] || meta["QuickTime:GPSCoordinates"]) as ExifValue;
+  if (combo) {
+    const m = String(combo).match(/(-?\d+(?:\.\d+)?)\s*,?\s*(-?\d+(?:\.\d+)?)/);
+    if (m) {
+      const lat = parseFloat(m[1]);
+      const lon = parseFloat(m[2]);
+      if (isFinite(lat) && isFinite(lon) && !(Math.abs(lat) < 1e-6 && Math.abs(lon) < 1e-6)) {
+        return { lat, lon };
+      }
+    }
+  }
+  return null;
+}
+
+/** Format GPS as "lat, lon" with 5 decimals (compact). */
+function formatGps(lat?: ExifValue, lon?: ExifValue): string {
+  const lt = typeof lat === "number" ? lat : Number(lat);
+  const ln = typeof lon === "number" ? lon : Number(lon);
+  if (!isFinite(lt) || !isFinite(ln)) return "—";
+  return `${lt.toFixed(5)}, ${ln.toFixed(5)}`;
+}
+
+/** Build a Google Maps link for given coords. */
+function googleMapsUrl(lat: number, lon: number): string {
+  const q = `${lat},${lon}`;
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(q)}`;
+}
+
+/** Parse common EXIF/QuickTime datetime into a YYYY-MM-DD day string. */
+function parseToDay(v: ExifValue): string | null {
+  if (v == null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+
+  // EXIF "YYYY:MM:DD HH:MM:SS" (accepts '-' too)
+  const exifMatch = s.match(/^(\d{4})([:\-])(\d{2})\2(\d{2})/);
+  if (exifMatch) {
+    const y = exifMatch[1];
+    const m = exifMatch[3];
+    const d = exifMatch[4];
+    return `${y}-${m}-${d}`;
+  }
+
+  // ISO-like / numeric (epoch sec/ms)
+  const num = Number(s);
+  const asDate = Number.isFinite(num) ? new Date(num > 1e12 ? num : num * 1000) : new Date(s);
+  if (!Number.isNaN(asDate.getTime())) {
+    const y = asDate.getUTCFullYear();
+    const m = String(asDate.getUTCMonth() + 1).padStart(2, "0");
+    const d = String(asDate.getUTCDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+  return null;
+}
+
+/** Streamlined: find a capture day by key suffix, independent of EXIF group. */
+function captureDayFromExif(meta: ExifData | null): string | null {
+  if (!meta) return null;
+
+  // Prefer the canonical shoot time, then common creation fallbacks.
+  const v =
+    pickFirstBySuffix(meta, [":DateTimeOriginal"]) ??
+    pickFirstBySuffix(meta, [":CreationDate"]) ??
+    pickFirstBySuffix(meta, [":CreateDate"]);
+
+  return parseToDay(v);
+}
+
+/** Return the first matching value where the key ends with one of the suffixes. */
+function pickFirstBySuffix(meta: Record<string, ExifValue> | null, suffixes: string[]): ExifValue {
+  if (!meta) return null;
+  for (const suf of suffixes) {
+    const k = Object.keys(meta).find((key) => key.endsWith(suf));
+    if (k) {
+      const v = meta[k];
+      if (v !== null && v !== undefined && String(v).trim() !== "") return v;
+    }
+  }
+  return null;
 }
 
 
@@ -95,35 +215,26 @@ export default function StagingView({
   /*  Local state (routing, data, selection)                                  */
   /* ------------------------------------------------------------------------ */
 
-  // Source roots; do NOT auto-pick a root (respect savedState or "").
   const [roots, setRoots] = useState<RootName[]>([]);
   const [root, setRoot] = useState<RootName | "">(savedState.root || "");
   const [path, setPath] = useState<string>(savedState.path || "");
 
-  // Directory listing + selection
   const [entries, setEntries] = useState<StagingEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<StagingEntry | null>(null);
 
-  // Directory stats
   const [stats, setStats] = useState<StagingStats | null>(null);
   const [statsError, setStatsError] = useState<string | null>(null);
 
-  // EXIF panel
   const [exifExpanded, setExifExpanded] = useState(false);
   const [exifData, setExifData] = useState<ExifData | null>(null);
   const [exifErr, setExifErr] = useState<string | null>(null);
 
-  // Scroll persistence
   const gridRef = useRef<HTMLDivElement | null>(null);
   const scrollRAF = useRef<number | null>(null);
 
-  // Lightweight “refresh” tick (used after Sync completes to refetch list/stats)
   const [refreshTick, setRefreshTick] = useState(0);
-
-  // Sync button state (disable while running)
   const [syncing, setSyncing] = useState(false);
-
 
   /* ------------------------------------------------------------------------ */
   /*  Derived selection → preview DTO                                         */
@@ -148,19 +259,16 @@ export default function StagingView({
   useEffect(() => {
     fetch(`${API_BASE}/api/staging/roots`)
       .then((r) => r.json())
-      .then((list: RootName[]) => {
-        setRoots(list);
-        // Note: do NOT auto-select a root here.
-      })
+      .then((list: RootName[]) => setRoots(list))
       .catch((e) => setError(`failed to load roots: ${String(e)}`));
   }, []);
 
   /* ------------------------------------------------------------------------ */
-  /*  Fetch: entries (depends on root, path, refreshTick)                     */
+  /*  Fetch: entries & stats (root, path, refreshTick)                        */
   /* ------------------------------------------------------------------------ */
 
   useEffect(() => {
-    if (!root) return; // require explicit selection
+    if (!root) return;
     const params = new URLSearchParams();
     params.set("root", root);
     if (path) params.set("path", path);
@@ -173,15 +281,10 @@ export default function StagingView({
       .then((list: StagingEntry[]) => {
         setEntries(list);
         setError(null);
-        // UX: collapse EXIF on nav changes; we try to restore selection separately
         setExifExpanded(false);
       })
       .catch((e) => setError(`failed to list: ${String(e)}`));
   }, [root, path, refreshTick]);
-
-  /* ------------------------------------------------------------------------ */
-  /*  Fetch: stats (same dependencies as entries)                             */
-  /* ------------------------------------------------------------------------ */
 
   useEffect(() => {
     if (!root) return;
@@ -217,7 +320,7 @@ export default function StagingView({
     const params = new URLSearchParams({
       root,
       path: selectedPreview.rel_path,
-      compact: "true",
+      compact: "false",
     });
 
     (async () => {
@@ -242,12 +345,10 @@ export default function StagingView({
   /* ------------------------------------------------------------------------ */
 
   useEffect(() => {
-    // Try to restore the previously selected item by rel_path
     if (savedState?.selectedRel && entries.length) {
       const match = entries.find((e) => !e.is_dir && e.rel_path === savedState.selectedRel) || null;
       setSelected(match);
     }
-    // Restore scroll position after the grid renders
     const t = setTimeout(() => {
       if (gridRef.current && typeof savedState?.scrollTop === "number") {
         gridRef.current.scrollTop = savedState.scrollTop!;
@@ -316,13 +417,11 @@ export default function StagingView({
   }
 
   /* ------------------------------------------------------------------------ */
-  /*  Right‑pane preview URL                                                   */
+  /*  Right-pane preview URL                                                   */
   /* ------------------------------------------------------------------------ */
 
   const previewSrc = useMemo(() => {
     if (!selectedPreview) return null;
-
-    // Pass the full filename to looksLikeVideo (fixes brittle ext handling)
     if (looksLikeVideo(selectedPreview.name)) {
       return { kind: "video" as const, url: selectedPreview.media_url ?? "" };
     }
@@ -340,12 +439,11 @@ export default function StagingView({
   /* ------------------------------------------------------------------------ */
 
   type MoveMode = "folder" | "folderRecursive" | "root" | "allRoots" | "selected";
-  const [moveMode, setMoveMode] = useState<MoveMode>("folder"); // remember last-used
+  const [moveMode, setMoveMode] = useState<MoveMode>("folder");
   const [dryRun, setDryRun] = useState<boolean>(true);
   const [moveMenuOpen, setMoveMenuOpen] = useState(false);
   const moveMenuRef = useRef<HTMLDivElement | null>(null);
 
-  // Close the menu when clicking outside
   useEffect(() => {
     function onDocDown(e: MouseEvent) {
       if (!moveMenuRef.current) return;
@@ -376,7 +474,6 @@ export default function StagingView({
   async function runMove(mode?: MoveMode) {
     const m = mode ?? moveMode;
 
-    // Guard rails
     if ((m === "folder" || m === "folderRecursive" || m === "root") && !root) {
       alert("Pick a source first.");
       return;
@@ -386,7 +483,6 @@ export default function StagingView({
       return;
     }
 
-    // Payload you’ll POST when backend is ready
     const payload: Record<string, unknown> = {
       mode: m,
       root: root || null,
@@ -407,7 +503,6 @@ export default function StagingView({
     if (!window.confirm(`${msg}\n\n${dryRun ? "(Dry run)" : "(Write mode)"}`)) return;
 
     try {
-      // TODO: wire to your backend ingest endpoint
       console.log("Would POST /api/ingest/run", payload);
       alert(`Queued ingest:\n${JSON.stringify(payload, null, 2)}`);
     } catch (e) {
@@ -422,28 +517,27 @@ export default function StagingView({
   /* ------------------------------------------------------------------------ */
 
   async function runSync() {
-  setSyncing(true);
-  try {
-    const res = await fetch(`${API_BASE}/api/staging/sync/icloud`, { method: "POST" });
-    const data = await res.json();
+    setSyncing(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/staging/sync/icloud`, { method: "POST" });
+      const data = await res.json();
 
-    if (data.status === "busy") {
-      alert("Sync is already running — please wait.");
-    } else if (data.status === "error") {
-      alert(`Config error:\n${data.msg}`);
-    } else if (data.exit_code === 0) {
-      alert("iCloud sync completed!");
-      setRefreshTick((t) => t + 1);
-    } else {
-      alert(`Sync failed (code ${data.exit_code}):\n${data.stderr || data.stdout || "No output"}`);
-    }
-  } catch (e) {
+      if (data.status === "busy") {
+        alert("Sync is already running — please wait.");
+      } else if (data.status === "error") {
+        alert(`Config error:\n${data.msg}`);
+      } else if (data.exit_code === 0) {
+        alert("iCloud sync completed!");
+        setRefreshTick((t) => t + 1); // re-query list/stats
+      } else {
+        alert(`Sync failed (code ${data.exit_code}):\n${data.stderr || data.stdout || "No output"}`);
+      }
+    } catch (e) {
     alert(`Failed to trigger sync: ${String(e)}`);
-  } finally {
-    setSyncing(false);
+    } finally {
+      setSyncing(false);
+    }
   }
-}
-
 
   /* ------------------------------------------------------------------------ */
   /*  Render                                                                   */
@@ -477,7 +571,7 @@ export default function StagingView({
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", paddingBottom: 4 }}>
-          {/* Source select (styled like action buttons) */}
+          {/* Source select */}
           <label style={{ position: "relative", display: "inline-block" }}>
             Source:&nbsp;
             <div style={{ position: "relative", display: "inline-block", width: 180 }}>
@@ -486,7 +580,7 @@ export default function StagingView({
                 value={root}
                 onChange={(e) => {
                   setRoot(e.target.value);
-                  setPath(""); // changing source resets path
+                  setPath("");
                 }}
               >
                 <option value="" disabled>select…</option>
@@ -494,7 +588,6 @@ export default function StagingView({
                   <option key={r} value={r}>{r}</option>
                 ))}
               </select>
-              {/* caret overlay */}
               <span className="px-caret">▾</span>
             </div>
           </label>
@@ -514,10 +607,8 @@ export default function StagingView({
             {syncing ? "⏳ Syncing…" : "🔄 Sync"}
           </button>
 
-
           {/* MOVE TO REVIEW: split button with scope menu */}
           <div ref={moveMenuRef} style={{ position: "relative", display: "inline-flex" }}>
-            {/* Primary (runs last-used scope) */}
             <button
               onClick={() => runMove()}
               disabled={primaryDisabled}
@@ -533,7 +624,6 @@ export default function StagingView({
               📤 Move to Review
             </button>
 
-            {/* Caret (opens the menu) */}
             <button
               onClick={() => setMoveMenuOpen((v) => !v)}
               className="px-pill px-action px-split-right"
@@ -543,7 +633,6 @@ export default function StagingView({
               ▾
             </button>
 
-            {/* Dropdown */}
             {moveMenuOpen && (
               <div
                 role="menu"
@@ -727,7 +816,7 @@ export default function StagingView({
       <div style={{ display: "grid", gridTemplateColumns: "1fr minmax(360px, 40%)", gap: 8, minHeight: 0, paddingBottom: 0 }}>
         {/* LEFT: grid */}
         <div
-          ref={gridRef} // capture scroll for persistence
+          ref={gridRef}
           onScroll={onGridScroll}
           style={{
             display: "grid",
@@ -742,11 +831,8 @@ export default function StagingView({
             boxSizing: "border-box",
             background: theme.surface,
             minHeight: 0,
-             // 👇 prevent rows from being stretched to fill the container
-            alignItems: "start",     // items don’t stretch vertically
-            alignContent: "start",   // rows pack at the top instead of stretching
-
-            // optional: make each row height fit content tightly
+            alignItems: "start",
+            alignContent: "start",
             gridAutoRows: "min-content",
           }}
         >
@@ -946,50 +1032,79 @@ export default function StagingView({
                 overflow: "auto",
               }}
             >
+              {/* ===== Collapsed curated view (Capture / Device / Location) ===== */}
               {!selectedPreview ? (
                 <div style={{ color: theme.muted }}>Select a file to view EXIF</div>
               ) : exifErr ? (
                 <div style={{ color: "#fca5a5" }}>Failed to load EXIF: {exifErr}</div>
               ) : !exifData ? (
                 <div style={{ color: theme.muted }}>Loading…</div>
-              ) : (
+              ) : !exifExpanded ? (
                 (() => {
-                  const entries = Object.entries(exifData) as Array<[string, ExifValue]>;
-                  const primaryKeys = new Set([
-                    "Basic:Filename",
-                    "Basic:Modified",
-                    "Basic:Size",
-                    "Basic:Path",
-                    "EXIF:DateTimeOriginal",
-                    "EXIF:CreateDate",
-                    "QuickTime:CreateDate",
-                    "EXIF:Make",
-                    "EXIF:Model",
-                    "EXIF:GPSLatitude",
-                    "EXIF:GPSLongitude",
-                  ]);
-                  const primary = entries.filter(([k]) => primaryKeys.has(k));
-                  const visible = exifExpanded ? entries : primary.length ? primary : entries.slice(0, 8);
-                  const hiddenCount = exifExpanded ? 0 : Math.max(entries.length - visible.length, 0);
+                  // 1) Capture DAY (no file-time fallback)
+                  const capture = captureDayFromExif(exifData) ?? "—";
+
+                  // 2) Device (Make + Model)
+                  const make = pickFirst(exifData, ["EXIF:Make", "QuickTime:Make", "IFD0:Make", "XMP:Make"]) || "";
+                  const model = pickFirst(exifData, ["EXIF:Model", "QuickTime:Model", "IFD0:Model", "XMP:Model"]) || "";
+                  const device = String([make, model].filter(Boolean).join(" ") || "—");
+
+                  // 3) Location (+ link to Maps when present)
+                  const gps = extractGps(exifData);
+                  const locationNode = gps ? (
+                    <span>
+                      {formatGps(gps.lat, gps.lon)}{" "}
+                      <a
+                        href={googleMapsUrl(gps.lat, gps.lon)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title="Open in Google Maps"
+                        aria-label="Open in Google Maps"
+                        style={{ textDecoration: "none" }}
+                      >
+                        🌐
+                      </a>
+                    </span>
+                  ) : (
+                    "—"
+                  );
+
+                  const rows: Array<[string, React.ReactNode]> = [
+                    ["Capture", capture],
+                    ["Device", device],
+                    ["Location", locationNode],
+                  ];
 
                   return (
-                    <>
-                      <table className="exif-table" style={{ width: "100%", borderCollapse: "collapse" }}>
-                        <tbody>
-                          {visible.map(([k, v]) => (
-                            <tr key={k} style={{ borderBottom: `1px solid ${theme.border}` }}>
-                              <td style={{ padding: "6px 8px", color: theme.muted, whiteSpace: "nowrap", verticalAlign: "top" }}>{k}</td>
-                              <td style={{ padding: "6px 8px", wordBreak: "break-word" }}>{String(v ?? "")}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                      {!exifExpanded && hiddenCount > 0 && (
-                        <div style={{ marginTop: 6, color: theme.muted }}>
-                          {hiddenCount} more field{hiddenCount === 1 ? "" : "s"} hidden. Click “Show EXIF” to expand.
-                        </div>
-                      )}
-                    </>
+                    <table className="exif-table" style={{ width: "100%", borderCollapse: "collapse" }}>
+                      <tbody>
+                        {rows.map(([k, v]) => (
+                          <tr key={k} style={{ borderBottom: `1px solid ${theme.border}` }}>
+                            <td style={{ padding: "6px 8px", color: theme.muted, whiteSpace: "nowrap", verticalAlign: "top" }}>
+                              {k}
+                            </td>
+                            <td style={{ padding: "6px 8px", wordBreak: "break-word" }}>{v}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  );
+                })()
+              ) : (
+                // ===================== Expanded: show all keys ====================
+                (() => {
+                  const exifEntries = Object.entries(exifData) as Array<[string, ExifValue]>;
+                  return (
+                    <table className="exif-table" style={{ width: "100%", borderCollapse: "collapse" }}>
+                      <tbody>
+                        {exifEntries.map(([k, v]) => (
+                          <tr key={k} style={{ borderBottom: `1px solid ${theme.border}` }}>
+                            <td style={{ padding: "6px 8px", color: theme.muted, whiteSpace: "nowrap", verticalAlign: "top" }}>{k}</td>
+                            <td style={{ padding: "6px 8px", wordBreak: "break-word" }}>{String(v ?? "")}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   );
                 })()
               )}
